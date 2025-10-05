@@ -1,8 +1,14 @@
 System {
-    int n = 1s;
+    name = "Atlas";
+    float version = "1.0";
     Network {
         interface "eth0" {
             bool dhcp = true;
+            string gateway = "192.168.1.1";
+        }
+
+        interface "wlan0" {
+            bool dhcp = false;
             string gateway = "192.168.1.1";
         }
     }
