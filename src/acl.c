@@ -1,6 +1,5 @@
 // parser.c
-// Minimal ACL2-like visual spec parser (blocks and typed fields).
-// Adds support for string and character literals.
+// ACL2-like visual spec parser with nested sub-blocks and literals.
 // Compile: gcc -std=c11 -O2 -o parser parser.c
 
 #include <stdio.h>
@@ -8,7 +7,7 @@
 #include <string.h>
 #include <ctype.h>
 
-/* ---------- simple lexer ---------- */
+/* ---------- lexer ---------- */
 
 typedef enum {
     TOK_EOF,
@@ -33,7 +32,7 @@ typedef struct {
     char *text;   // for ident/string
     long  ival;   // for int
     int   bval;   // for bool
-    int   cval;   // for char (stored as int)
+    int   cval;   // for char
 } Token;
 
 static const char *src;
@@ -134,8 +133,7 @@ static Token next_token() {
         } else {
             ch = getc_src();
         }
-        // expect closing '
-        if (peekc() == '\'') srcpos++; else { /* tolerate missing */ }
+        if (peekc() == '\'') srcpos++;
         tk.kind = TOK_CHAR;
         tk.cval = ch;
         return tk;
@@ -193,9 +191,12 @@ typedef struct Field {
 } Field;
 
 typedef struct Block {
-    char *name;
+    char *name;           // block name (identifier)
+    char *label;          // optional label (string), NULL if absent
     Field *fields;
-    struct Block *next;
+    struct Block *children; // linked list of child blocks
+    struct Block *next;     // next sibling block in same list
+    struct Block *parent;   // parent block or NULL
 } Block;
 
 typedef struct {
@@ -225,36 +226,17 @@ static int accept(TokenKind k) {
     return P.cur.kind == k;
 }
 
-static char* token_type(TokenKind k) {
-    switch (k) {
-        case TOK_EOF: return "EOF";
-        case TOK_IDENT: return "IDENT";
-        case TOK_INT: return "INT";
-        case TOK_STRING: return "STRING";
-        case TOK_CHAR: return "CHAR";
-        case TOK_BOOL: return "BOOL";
-        case TOK_LBRACE: return "{";
-        case TOK_RBRACE: return "}";
-        case TOK_EQ: return "=";
-        case TOK_SEMI: return ";";
-        case TOK_TYPE_INT: return "TYPE_INT";
-        case TOK_TYPE_FLOAT: return "TYPE_FLOAT";
-        case TOK_TYPE_BOOL: return "TYPE_BOOL";
-        case TOK_TYPE_STRING: return "TYPE_STRING";
-        default: return "UNKNOWN";
-    }
-}
-
 static int expect(TokenKind k, const char *msg) {
     if (!P.have_cur) advance();
     if (P.cur.kind == k) return 1;
-    fprintf(stderr, "Parse error: expected token %s but got %s. %s\n", token_type(k), token_type(P.cur.kind), msg?msg:"");
+    fprintf(stderr, "Parse error: expected token %d but got %d. %s\n", (int)k, (int)P.cur.kind, msg?msg:"");
     exit(1);
 }
 
 static char *dupstr(const char *s) { return s ? strdup(s) : NULL; }
 
-/* parse a literal expression (supports int, bool, string, char) */
+/* ---------- literal expression parsing ---------- */
+
 static Value parse_literal_expr() {
     if (!P.have_cur) advance();
     Token tk = P.cur;
@@ -281,12 +263,13 @@ static Value parse_literal_expr() {
         advance();
         return v;
     } else {
-        fprintf(stderr, "Parse error: expected literal expression, got token kind %s\n", token_type(tk.kind));
+        fprintf(stderr, "Parse error: expected literal expression, got token kind %d\n", (int)tk.kind);
         exit(1);
     }
 }
 
-/* parse a typed or inferred field: [type] name = expr; */
+/* ---------- field parsing ---------- */
+
 static Field *parse_field(int type_expected) {
     char *type = NULL;
     if (type_expected) {
@@ -323,8 +306,22 @@ static Field *parse_field(int type_expected) {
     return f;
 }
 
-/* parse block: Name { ... } */
-static Block *parse_block() {
+/* ---------- block parsing (with sub-blocks) ---------- */
+
+static Block *make_block(const char *name, const char *label, Block *parent) {
+    Block *b = malloc(sizeof(Block));
+    memset(b,0,sizeof(Block));
+    b->name = dupstr(name);
+    b->label = dupstr(label);
+    b->fields = NULL;
+    b->children = NULL;
+    b->next = NULL;
+    b->parent = parent;
+    return b;
+}
+
+/* parse a single block starting at an identifier (the current token should be IDENT) */
+static Block *parse_block_recursive(Block *parent) {
     if (!P.have_cur) advance();
     if (P.cur.kind != TOK_IDENT) {
         fprintf(stderr, "Parse error: expected block name identifier\n");
@@ -333,16 +330,22 @@ static Block *parse_block() {
     char *bname = strdup(P.cur.text);
     advance();
 
-    expect(TOK_LBRACE, "after block name");
+    /* optional label: a string literal immediately after the identifier */
+    char *label = NULL;
+    if (!P.have_cur) advance();
+    if (P.cur.kind == TOK_STRING) {
+        label = strdup(P.cur.text);
+        advance();
+    }
+
+    expect(TOK_LBRACE, "after block name/label");
     advance();
 
-    Block *blk = malloc(sizeof(Block));
-    memset(blk,0,sizeof(Block));
-    blk->name = bname;
-    blk->fields = NULL;
-    blk->next = NULL;
+    Block *blk = make_block(bname, label, parent);
+    free(bname); if (label) free(label);
 
     Field *lastf = NULL;
+    Block *lastchild = NULL;
 
     while (1) {
         if (!P.have_cur) advance();
@@ -355,6 +358,7 @@ static Block *parse_block() {
             exit(1);
         }
 
+        /* detect typed field */
         if (P.cur.kind == TOK_TYPE_INT || P.cur.kind == TOK_TYPE_FLOAT ||
             P.cur.kind == TOK_TYPE_BOOL || P.cur.kind == TOK_TYPE_STRING) {
             Field *f = parse_field(1);
@@ -362,11 +366,51 @@ static Block *parse_block() {
             lastf = f;
             continue;
         }
+
+        /* detect inferred field (ident = expr;) */
         if (P.cur.kind == TOK_IDENT) {
-            Field *f = parse_field(0);
-            if (!blk->fields) blk->fields = f; else lastf->next = f;
-            lastf = f;
-            continue;
+            /* but IDENT followed by STRING then LBRACE indicates a child block with label */
+            Token look = P.cur;
+            // peek ahead without consuming by saving state
+            size_t save_pos = srcpos;
+            TokenKind save_kind = P.cur.kind;
+            char *save_text = P.cur.text ? strdup(P.cur.text) : NULL;
+            int have_save = P.have_cur;
+
+            // to determine if it's a child block, need to check next token(s)
+            advance(); // consume IDENT
+            if (!P.have_cur) advance();
+            int is_child = 0;
+            if (P.cur.kind == TOK_STRING) {
+                // could be labeled child; check next token
+                advance();
+                if (!P.have_cur) advance();
+                if (P.cur.kind == TOK_LBRACE) is_child = 1;
+            } else if (P.cur.kind == TOK_LBRACE) {
+                is_child = 1;
+            }
+
+            // restore parser state to before IDENT
+            // free current token text and restore P.cur
+            if (P.have_cur) tk_free(&P.cur);
+            P.have_cur = have_save;
+            srcpos = save_pos;
+            if (P.cur.text) { free(P.cur.text); P.cur.text = NULL; }
+            P.cur.kind = save_kind;
+            P.cur.text = save_text;
+
+            if (is_child) {
+                Block *child = parse_block_recursive(blk); // parse child with parent
+                if (!blk->children) blk->children = child; else lastchild->next = child;
+                lastchild = child;
+                continue;
+            } else {
+                // treat as inferred field (identifier regained)
+                Field *f = parse_field(0);
+                if (!blk->fields) blk->fields = f; else lastf->next = f;
+                lastf = f;
+                continue;
+            }
         }
 
         fprintf(stderr, "Parse error: unexpected token inside block (kind %d)\n", (int)P.cur.kind);
@@ -376,14 +420,14 @@ static Block *parse_block() {
     return blk;
 }
 
-/* parse whole file: sequence of blocks */
+/* parse top-level sequence of blocks */
 static Block *parse_all() {
     Block *head = NULL, *last = NULL;
     while (1) {
         if (!P.have_cur) advance();
         if (P.cur.kind == TOK_EOF) break;
         if (P.cur.kind == TOK_IDENT) {
-            Block *b = parse_block();
+            Block *b = parse_block_recursive(NULL);
             if (!head) head = b; else last->next = b;
             last = b;
             continue;
@@ -413,21 +457,35 @@ static void print_value(const Value *v) {
     }
 }
 
+static void print_block_recursive(const Block *blk, int indent) {
+    for (int i = 0; i < indent; ++i) printf("  ");
+    if (blk->label)
+        printf("Block: %s  label: \"%s\"\n", blk->name, blk->label);
+    else
+        printf("Block: %s\n", blk->name);
+
+    for (const Field *f = blk->fields; f; f = f->next) {
+        for (int i = 0; i < indent; ++i) printf("  ");
+        printf("  Field: %s  ", f->name);
+        if (f->type) printf("(type: %s)  ", f->type); else printf("(type: inferred)  ");
+        printf("value: ");
+        print_value(&f->val);
+        printf("\n");
+    }
+
+    for (const Block *c = blk->children; c; c = c->next) {
+        print_block_recursive(c, indent + 1);
+    }
+}
+
 static void print_blocks(const Block *b) {
     for (const Block *blk = b; blk; blk = blk->next) {
-        printf("Block: %s\n", blk->name);
-        for (const Field *f = blk->fields; f; f = f->next) {
-            printf("  Field: %s  ", f->name);
-            if (f->type) printf("(type: %s)  ", f->type); else printf("(type: inferred)  ");
-            printf("value: ");
-            print_value(&f->val);
-            printf("\n");
-        }
+        print_block_recursive(blk, 0);
         printf("\n");
     }
 }
 
-/* ---------- utilities ---------- */
+/* ---------- utilities and freeing ---------- */
 
 static char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
@@ -441,6 +499,27 @@ static char *read_file(const char *path) {
     buf[sz] = '\0';
     fclose(fp);
     return buf;
+}
+
+static void free_blocks(Block *b) {
+    while (b) {
+        Block *nb = b->next;
+        if (b->name) free(b->name);
+        if (b->label) free(b->label);
+        for (Field *f = b->fields; f; ) {
+            Field *nf = f->next;
+            if (f->type) free(f->type);
+            if (f->name) free(f->name);
+            if (f->val.kind == VAL_STRING && f->val.sval) free(f->val.sval);
+            free(f);
+            f = nf;
+        }
+        if (b->children) {
+            free_blocks(b->children);
+        }
+        free(b);
+        b = nb;
+    }
 }
 
 /* ---------- main ---------- */
@@ -471,20 +550,7 @@ int main(int argc, char **argv) {
 
     print_blocks(root);
 
-    for (Block *b = root; b; ) {
-        Block *nb = b->next;
-        free(b->name);
-        for (Field *f = b->fields; f; ) {
-            Field *nf = f->next;
-            if (f->type) free(f->type);
-            if (f->name) free(f->name);
-            if (f->val.kind == VAL_STRING && f->val.sval) free(f->val.sval);
-            free(f);
-            f = nf;
-        }
-        free(b);
-        b = nb;
-    }
+    free_blocks(root);
 
     if (P.have_cur) tk_free(&P.cur);
     free(text);
