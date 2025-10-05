@@ -590,29 +590,21 @@ static void free_blocks(Block *b) {
 
 int main(int argc, char **argv) {
     char *text = NULL;
-    if (argc >= 2) {
-        const char *fn = argv[1];
-        FILE *f = fopen(fn, "rb");
-        if (!f) { perror("fopen"); return 1; }
-        fseek(f, 0, SEEK_END);
-        long sz = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        text = malloc(sz+1);
-        if (!text) { fclose(f); return 1; }
-        if (fread(text, 1, sz, f) != (size_t)sz) { fclose(f); free(text); return 1; }
-        text[sz] = '\0';
-        fclose(f);
-    } else {
-        size_t cap = 4096, len = 0;
-        text = malloc(cap);
-        if (!text) return 1;
-        int c;
-        while ((c = getchar()) != EOF) {
-            if (len+2 >= cap) { cap *= 2; text = realloc(text, cap); if (!text) return 1; }
-            text[len++] = (char)c;
-        }
-        text[len] = '\0';
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <input-file>\n", argv[0]);
+        return 1;
     }
+    const char *fn = argv[1];
+    FILE *f = fopen(fn, "rb");
+    if (!f) { perror("fopen"); return 1; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    text = malloc(sz+1);
+    if (!text) { fclose(f); return 1; }
+    if (fread(text, 1, sz, f) != (size_t)sz) { fclose(f); free(text); return 1; }
+    text[sz] = '\0';
+    fclose(f);
 
     Block *root = parse_all(text);
     print_all(root);
