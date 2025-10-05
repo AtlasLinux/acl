@@ -1,5 +1,5 @@
 // parser.c
-// ACL2-like visual spec parser with nested sub-blocks and literals.
+// ACL2-like visual spec parser with nested sub-blocks, literals, and improved errors.
 // Compile: gcc -std=c11 -O2 -o parser parser.c
 
 #include <stdio.h>
@@ -7,7 +7,7 @@
 #include <string.h>
 #include <ctype.h>
 
-/* ---------- lexer ---------- */
+/* ---------- lexer with position tracking ---------- */
 
 typedef enum {
     TOK_EOF,
@@ -33,40 +33,48 @@ typedef struct {
     long  ival;   // for int
     int   bval;   // for bool
     int   cval;   // for char
+    size_t pos;   // byte index in source where token started
+    int line;     // 1-based
+    int col;      // 1-based
 } Token;
 
-static const char *src;
-static size_t srcpos;
-static size_t srclen;
+static const char *src = NULL;
+static size_t srcpos = 0;
+static size_t srclen = 0;
+static int curline = 1;
+static int curcol = 1;
+
+static void advance_pos(char c) {
+    if (c == '\n') { curline++; curcol = 1; } else curcol++;
+}
 
 static void skip_spaces_and_comments() {
     while (srcpos < srclen) {
         char c = src[srcpos];
-        if (isspace((unsigned char)c)) { srcpos++; continue; }
+        if (isspace((unsigned char)c)) { advance_pos(c); srcpos++; continue; }
         if (c == '/' && srcpos+1 < srclen && src[srcpos+1] == '/') {
-            srcpos += 2;
-            while (srcpos < srclen && src[srcpos] != '\n') srcpos++;
+            // line comment
+            advance_pos('/'); srcpos++;
+            advance_pos('/'); srcpos++;
+            while (srcpos < srclen && src[srcpos] != '\n') { advance_pos(src[srcpos]); srcpos++; }
             continue;
         }
         if (c == '/' && srcpos+1 < srclen && src[srcpos+1] == '*') {
-            srcpos += 2;
-            while (srcpos+1 < srclen && !(src[srcpos]=='*' && src[srcpos+1]=='/')) srcpos++;
-            if (srcpos+1 < srclen) srcpos += 2;
+            // block comment
+            advance_pos('/'); srcpos++;
+            advance_pos('*'); srcpos++;
+            while (srcpos+1 < srclen && !(src[srcpos]=='*' && src[srcpos+1]=='/')) {
+                advance_pos(src[srcpos]); srcpos++;
+            }
+            if (srcpos+1 < srclen) { advance_pos('*'); srcpos++; advance_pos('/'); srcpos++; }
             continue;
         }
         break;
     }
 }
 
-static char peekc() {
-    if (srcpos >= srclen) return '\0';
-    return src[srcpos];
-}
-
-static char getc_src() {
-    if (srcpos >= srclen) return '\0';
-    return src[srcpos++];
-}
+static char peekc() { return srcpos < srclen ? src[srcpos] : '\0'; }
+static char getc_src() { char c = peekc(); if (c) { advance_pos(c); srcpos++; } return c; }
 
 static char *substr_range(size_t a, size_t b) {
     size_t n = b - a;
@@ -94,17 +102,18 @@ static int parse_escape_char() {
 
 static Token next_token() {
     skip_spaces_and_comments();
-    Token tk = { TOK_EOF, NULL, 0, 0, 0 };
+    Token tk = { TOK_EOF, NULL, 0, 0, 0, srcpos, curline, curcol };
     if (srcpos >= srclen) { tk.kind = TOK_EOF; return tk; }
     char c = peekc();
+    tk.pos = srcpos; tk.line = curline; tk.col = curcol;
 
-    if (c == '{') { srcpos++; tk.kind = TOK_LBRACE; return tk; }
-    if (c == '}') { srcpos++; tk.kind = TOK_RBRACE; return tk; }
-    if (c == '=') { srcpos++; tk.kind = TOK_EQ; return tk; }
-    if (c == ';') { srcpos++; tk.kind = TOK_SEMI; return tk; }
+    if (c == '{') { getc_src(); tk.kind = TOK_LBRACE; return tk; }
+    if (c == '}') { getc_src(); tk.kind = TOK_RBRACE; return tk; }
+    if (c == '=') { getc_src(); tk.kind = TOK_EQ; return tk; }
+    if (c == ';') { getc_src(); tk.kind = TOK_SEMI; return tk; }
 
     if (c == '"') {
-        srcpos++; // skip "
+        getc_src(); // skip "
         size_t cap = 128, len = 0;
         char *buf = malloc(cap);
         if (!buf) exit(1);
@@ -125,15 +134,15 @@ static Token next_token() {
     }
 
     if (c == '\'') {
-        srcpos++; // skip '
+        getc_src(); // skip '
         int ch;
         if (peekc() == '\\') {
-            srcpos++; // skip backslash
+            getc_src(); // skip backslash
             ch = parse_escape_char();
         } else {
             ch = getc_src();
         }
-        if (peekc() == '\'') srcpos++;
+        if (peekc() == '\'') getc_src();
         tk.kind = TOK_CHAR;
         tk.cval = ch;
         return tk;
@@ -141,8 +150,8 @@ static Token next_token() {
 
     if (isalpha((unsigned char)c) || c == '_') {
         size_t a = srcpos;
-        srcpos++;
-        while (srcpos < srclen && (isalnum((unsigned char)src[srcpos]) || src[srcpos] == '_')) srcpos++;
+        getc_src();
+        while (srcpos < srclen && (isalnum((unsigned char)src[srcpos]) || src[srcpos] == '_')) getc_src();
         char *s = substr_range(a, srcpos);
         if (strcmp(s, "int") == 0) { free(s); tk.kind = TOK_TYPE_INT; return tk; }
         if (strcmp(s, "float") == 0) { free(s); tk.kind = TOK_TYPE_FLOAT; return tk; }
@@ -157,8 +166,8 @@ static Token next_token() {
 
     if (isdigit((unsigned char)c) || (c=='-' && srcpos+1 < srclen && isdigit((unsigned char)src[srcpos+1]))) {
         size_t a = srcpos;
-        if (src[srcpos] == '-') srcpos++;
-        while (srcpos < srclen && isdigit((unsigned char)src[srcpos])) srcpos++;
+        if (peekc() == '-') getc_src();
+        while (srcpos < srclen && isdigit((unsigned char)src[srcpos])) getc_src();
         char *s = substr_range(a, srcpos);
         tk.kind = TOK_INT;
         tk.ival = strtol(s, NULL, 10);
@@ -166,7 +175,8 @@ static Token next_token() {
         return tk;
     }
 
-    srcpos++;
+    // unknown token (single char)
+    getc_src();
     tk.kind = TOK_UNKNOWN;
     return tk;
 }
@@ -208,93 +218,138 @@ static Parser P;
 
 static void tk_free(Token *t) {
     if (!t) return;
-    if (t->text) free(t->text);
-    t->text = NULL;
+    if (t->text) { free(t->text); t->text = NULL; }
 }
 
 static void advance() {
-    if (P.have_cur) {
-        tk_free(&P.cur);
-        P.have_cur = 0;
-    }
+    if (P.have_cur) { tk_free(&P.cur); P.have_cur = 0; }
     P.cur = next_token();
     P.have_cur = 1;
 }
 
-static int accept(TokenKind k) {
-    if (!P.have_cur) advance();
-    return P.cur.kind == k;
+/* ---------- error reporting helpers ---------- */
+
+static const char *tokname(TokenKind k) {
+    switch (k) {
+        case TOK_EOF: return "EOF";
+        case TOK_IDENT: return "identifier";
+        case TOK_INT: return "integer";
+        case TOK_STRING: return "string";
+        case TOK_CHAR: return "char";
+        case TOK_BOOL: return "boolean";
+        case TOK_LBRACE: return "'{'";
+        case TOK_RBRACE: return "'}'";
+        case TOK_EQ: return "'='";
+        case TOK_SEMI: return "';'";
+        case TOK_TYPE_INT: return "type int";
+        case TOK_TYPE_FLOAT: return "type float";
+        case TOK_TYPE_BOOL: return "type bool";
+        case TOK_TYPE_STRING: return "type string";
+        case TOK_UNKNOWN: return "unknown";
+        default: return "token";
+    }
 }
 
-static int expect(TokenKind k, const char *msg) {
+static void show_source_line_context(size_t pos, int line, int col) {
+    // print the full source line containing pos, then a caret under col
+    size_t i = pos;
+    // find start of line
+    while (i > 0 && src[i-1] != '\n') i--;
+    size_t j = i;
+    while (j < srclen && src[j] != '\n') j++;
+    size_t len = j - i;
+    char *linebuf = malloc(len + 1 + 1);
+    if (!linebuf) return;
+    memcpy(linebuf, src + i, len);
+    linebuf[len] = '\0';
+    fprintf(stderr, "  %s\n", linebuf);
+    // caret line
+    int caret_pos = col - 1;
+    int printed = 2; // for "  "
+    fprintf(stderr, "  ");
+    for (int k = 0; k < caret_pos && k < (int)len; ++k) fputc((linebuf[k] == '\t') ? '\t' : ' ', stderr);
+    fprintf(stderr, "^\n");
+    free(linebuf);
+}
+
+static void parse_error_unexpected(const char *expecting) {
     if (!P.have_cur) advance();
-    if (P.cur.kind == k) return 1;
-    fprintf(stderr, "Parse error: expected token %d but got %d. %s\n", (int)k, (int)P.cur.kind, msg?msg:"");
+    Token *t = &P.cur;
+    fprintf(stderr, "Parse error at %d:%d: unexpected %s", t->line, t->col, tokname(t->kind));
+    if (t->text) fprintf(stderr, " ('%s')", t->text);
+    if (t->kind == TOK_INT) fprintf(stderr, " (value=%ld)", t->ival);
+    if (t->kind == TOK_CHAR) fprintf(stderr, " (char=0x%02x)", t->cval);
+    if (expecting) fprintf(stderr, ", expected %s", expecting);
+    fprintf(stderr, ".\n");
+    show_source_line_context(t->pos, t->line, t->col);
     exit(1);
 }
 
-static char *dupstr(const char *s) { return s ? strdup(s) : NULL; }
+static void parse_error_msg(const char *msg) {
+    if (!P.have_cur) advance();
+    Token *t = &P.cur;
+    fprintf(stderr, "Parse error at %d:%d: %s\n", t->line, t->col, msg);
+    show_source_line_context(t->pos, t->line, t->col);
+    exit(1);
+}
+
+/* ---------- utility helpers ---------- */
+
+static int accept(TokenKind k) { if (!P.have_cur) advance(); return P.cur.kind == k; }
+
+static void expect_tok(TokenKind k, const char *what) {
+    if (!P.have_cur) advance();
+    if (P.cur.kind == k) return;
+    parse_error_unexpected(what);
+}
 
 /* ---------- literal expression parsing ---------- */
 
 static Value parse_literal_expr() {
     if (!P.have_cur) advance();
     Token tk = P.cur;
-    Value v;
-    memset(&v,0,sizeof(v));
+    Value v; memset(&v,0,sizeof(v));
     if (tk.kind == TOK_INT) {
-        v.kind = VAL_INT;
-        v.ival = tk.ival;
-        advance();
-        return v;
+        v.kind = VAL_INT; v.ival = tk.ival; advance(); return v;
     } else if (tk.kind == TOK_BOOL) {
-        v.kind = VAL_BOOL;
-        v.bval = tk.bval;
-        advance();
-        return v;
+        v.kind = VAL_BOOL; v.bval = tk.bval; advance(); return v;
     } else if (tk.kind == TOK_STRING) {
-        v.kind = VAL_STRING;
-        v.sval = strdup(tk.text);
-        advance();
-        return v;
+        v.kind = VAL_STRING; v.sval = strdup(tk.text); advance(); return v;
     } else if (tk.kind == TOK_CHAR) {
-        v.kind = VAL_CHAR;
-        v.cval = tk.cval;
-        advance();
-        return v;
+        v.kind = VAL_CHAR; v.cval = tk.cval; advance(); return v;
     } else {
-        fprintf(stderr, "Parse error: expected literal expression, got token kind %d\n", (int)tk.kind);
-        exit(1);
+        parse_error_unexpected("literal (int, bool, string, or char)");
+        return v;
     }
 }
 
 /* ---------- field parsing ---------- */
 
+static char *dupstr(const char *s) { return s ? strdup(s) : NULL; }
+
 static Field *parse_field(int type_expected) {
     char *type = NULL;
     if (type_expected) {
+        if (!P.have_cur) advance();
         if (P.cur.kind == TOK_TYPE_INT) type = dupstr("int");
         else if (P.cur.kind == TOK_TYPE_FLOAT) type = dupstr("float");
         else if (P.cur.kind == TOK_TYPE_BOOL) type = dupstr("bool");
         else if (P.cur.kind == TOK_TYPE_STRING) type = dupstr("string");
-        else { fprintf(stderr, "internal parser error: unexpected type token\n"); exit(1); }
+        else parse_error_unexpected("type (int, float, bool, string)");
         advance();
     }
 
     if (!P.have_cur) advance();
-    if (P.cur.kind != TOK_IDENT) {
-        fprintf(stderr, "Parse error: expected identifier for field name\n");
-        exit(1);
-    }
-    char *name = strdup(P.cur.text);
+    if (P.cur.kind != TOK_IDENT) parse_error_unexpected("field name (identifier)");
+    char *name = dupstr(P.cur.text);
     advance();
 
-    expect(TOK_EQ, "after field name");
+    expect_tok(TOK_EQ, "'=' after field name");
     advance();
 
     Value v = parse_literal_expr();
 
-    expect(TOK_SEMI, "after field expression");
+    expect_tok(TOK_SEMI, "';' after field expression");
     advance();
 
     Field *f = malloc(sizeof(Field));
@@ -323,22 +378,18 @@ static Block *make_block(const char *name, const char *label, Block *parent) {
 /* parse a single block starting at an identifier (the current token should be IDENT) */
 static Block *parse_block_recursive(Block *parent) {
     if (!P.have_cur) advance();
-    if (P.cur.kind != TOK_IDENT) {
-        fprintf(stderr, "Parse error: expected block name identifier\n");
-        exit(1);
-    }
-    char *bname = strdup(P.cur.text);
+    if (P.cur.kind != TOK_IDENT) parse_error_unexpected("block name (identifier)");
+    char *bname = dupstr(P.cur.text);
     advance();
 
-    /* optional label: a string literal immediately after the identifier */
     char *label = NULL;
     if (!P.have_cur) advance();
     if (P.cur.kind == TOK_STRING) {
-        label = strdup(P.cur.text);
+        label = dupstr(P.cur.text);
         advance();
     }
 
-    expect(TOK_LBRACE, "after block name/label");
+    expect_tok(TOK_LBRACE, "'{' after block name/label");
     advance();
 
     Block *blk = make_block(bname, label, parent);
@@ -349,16 +400,9 @@ static Block *parse_block_recursive(Block *parent) {
 
     while (1) {
         if (!P.have_cur) advance();
-        if (P.cur.kind == TOK_RBRACE) {
-            advance();
-            break;
-        }
-        if (P.cur.kind == TOK_EOF) {
-            fprintf(stderr, "Parse error: unexpected EOF inside block\n");
-            exit(1);
-        }
+        if (P.cur.kind == TOK_RBRACE) { advance(); break; }
+        if (P.cur.kind == TOK_EOF) parse_error_msg("unexpected end of file inside block");
 
-        /* detect typed field */
         if (P.cur.kind == TOK_TYPE_INT || P.cur.kind == TOK_TYPE_FLOAT ||
             P.cur.kind == TOK_TYPE_BOOL || P.cur.kind == TOK_TYPE_STRING) {
             Field *f = parse_field(1);
@@ -367,22 +411,19 @@ static Block *parse_block_recursive(Block *parent) {
             continue;
         }
 
-        /* detect inferred field (ident = expr;) */
         if (P.cur.kind == TOK_IDENT) {
-            /* but IDENT followed by STRING then LBRACE indicates a child block with label */
-            Token look = P.cur;
-            // peek ahead without consuming by saving state
+            // need to distinguish between inferred field and child block
+            // save parser state
             size_t save_pos = srcpos;
-            TokenKind save_kind = P.cur.kind;
+            int save_line = curline, save_col = curcol;
+            Token save_tok = P.cur;
             char *save_text = P.cur.text ? strdup(P.cur.text) : NULL;
-            int have_save = P.have_cur;
 
-            // to determine if it's a child block, need to check next token(s)
-            advance(); // consume IDENT
+            // lookahead
+            advance(); // consumed IDENT
             if (!P.have_cur) advance();
             int is_child = 0;
             if (P.cur.kind == TOK_STRING) {
-                // could be labeled child; check next token
                 advance();
                 if (!P.have_cur) advance();
                 if (P.cur.kind == TOK_LBRACE) is_child = 1;
@@ -390,22 +431,20 @@ static Block *parse_block_recursive(Block *parent) {
                 is_child = 1;
             }
 
-            // restore parser state to before IDENT
-            // free current token text and restore P.cur
+            // restore state
             if (P.have_cur) tk_free(&P.cur);
-            P.have_cur = have_save;
-            srcpos = save_pos;
-            if (P.cur.text) { free(P.cur.text); P.cur.text = NULL; }
-            P.cur.kind = save_kind;
+            P.cur = save_tok;
             P.cur.text = save_text;
+            srcpos = save_pos;
+            curline = save_line; curcol = save_col;
+            P.have_cur = 1;
 
             if (is_child) {
-                Block *child = parse_block_recursive(blk); // parse child with parent
+                Block *child = parse_block_recursive(blk);
                 if (!blk->children) blk->children = child; else lastchild->next = child;
                 lastchild = child;
                 continue;
             } else {
-                // treat as inferred field (identifier regained)
                 Field *f = parse_field(0);
                 if (!blk->fields) blk->fields = f; else lastf->next = f;
                 lastf = f;
@@ -413,8 +452,7 @@ static Block *parse_block_recursive(Block *parent) {
             }
         }
 
-        fprintf(stderr, "Parse error: unexpected token inside block (kind %d)\n", (int)P.cur.kind);
-        exit(1);
+        parse_error_unexpected("field, typed field, or child block");
     }
 
     return blk;
@@ -432,8 +470,7 @@ static Block *parse_all() {
             last = b;
             continue;
         }
-        fprintf(stderr, "Parse error: expected top-level block name\n");
-        exit(1);
+        parse_error_unexpected("top-level block name (identifier)");
     }
     return head;
 }
@@ -514,9 +551,7 @@ static void free_blocks(Block *b) {
             free(f);
             f = nf;
         }
-        if (b->children) {
-            free_blocks(b->children);
-        }
+        if (b->children) free_blocks(b->children);
         free(b);
         b = nb;
     }
@@ -544,6 +579,7 @@ int main(int argc, char **argv) {
     src = text;
     srcpos = 0;
     srclen = strlen(src);
+    curline = 1; curcol = 1;
     P.have_cur = 0;
 
     Block *root = parse_all();
