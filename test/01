@@ -1,0 +1,4 @@
+System {
+    int n = 1;
+    string m = 42;
+}
