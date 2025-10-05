@@ -1,5 +1,6 @@
 // parser.c
 // Minimal ACL2-like visual spec parser (blocks and typed fields).
+// Adds support for string and character literals.
 // Compile: gcc -std=c11 -O2 -o parser parser.c
 
 #include <stdio.h>
@@ -14,6 +15,7 @@ typedef enum {
     TOK_IDENT,
     TOK_INT,
     TOK_STRING,
+    TOK_CHAR,
     TOK_BOOL,
     TOK_LBRACE, // {
     TOK_RBRACE, // }
@@ -31,6 +33,7 @@ typedef struct {
     char *text;   // for ident/string
     long  ival;   // for int
     int   bval;   // for bool
+    int   cval;   // for char (stored as int)
 } Token;
 
 static const char *src;
@@ -41,13 +44,11 @@ static void skip_spaces_and_comments() {
     while (srcpos < srclen) {
         char c = src[srcpos];
         if (isspace((unsigned char)c)) { srcpos++; continue; }
-        // line comment //
         if (c == '/' && srcpos+1 < srclen && src[srcpos+1] == '/') {
             srcpos += 2;
             while (srcpos < srclen && src[srcpos] != '\n') srcpos++;
             continue;
         }
-        // block comment /* ... */
         if (c == '/' && srcpos+1 < srclen && src[srcpos+1] == '*') {
             srcpos += 2;
             while (srcpos+1 < srclen && !(src[srcpos]=='*' && src[srcpos+1]=='/')) srcpos++;
@@ -77,43 +78,69 @@ static char *substr_range(size_t a, size_t b) {
     return s;
 }
 
+static int parse_escape_char() {
+    if (srcpos >= srclen) return '\\';
+    char esc = getc_src();
+    switch (esc) {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case '\\': return '\\';
+        case '\'': return '\'';
+        case '"': return '"';
+        case '0': return '\0';
+        default: return (unsigned char)esc;
+    }
+}
+
 static Token next_token() {
     skip_spaces_and_comments();
-    Token tk = { TOK_EOF, NULL, 0, 0 };
+    Token tk = { TOK_EOF, NULL, 0, 0, 0 };
     if (srcpos >= srclen) { tk.kind = TOK_EOF; return tk; }
     char c = peekc();
 
-    // braces and punctuation
     if (c == '{') { srcpos++; tk.kind = TOK_LBRACE; return tk; }
     if (c == '}') { srcpos++; tk.kind = TOK_RBRACE; return tk; }
     if (c == '=') { srcpos++; tk.kind = TOK_EQ; return tk; }
     if (c == ';') { srcpos++; tk.kind = TOK_SEMI; return tk; }
 
-    // string literal
     if (c == '"') {
-        size_t start = srcpos;
         srcpos++; // skip "
-        char buf[4096];
-        size_t bi = 0;
+        size_t cap = 128, len = 0;
+        char *buf = malloc(cap);
+        if (!buf) exit(1);
         while (srcpos < srclen) {
             char ch = getc_src();
             if (ch == '"') break;
-            if (ch == '\\' && srcpos < srclen) {
-                char esc = getc_src();
-                if (esc == 'n') ch = '\n';
-                else if (esc == 't') ch = '\t';
-                else if (esc == 'r') ch = '\r';
-                else ch = esc;
+            if (ch == '\\') {
+                int ec = parse_escape_char();
+                ch = (char)ec;
             }
-            if (bi < sizeof(buf)-1) buf[bi++] = ch;
+            if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); if (!buf) exit(1); }
+            buf[len++] = ch;
         }
-        buf[bi] = '\0';
+        buf[len] = '\0';
         tk.kind = TOK_STRING;
-        tk.text = strdup(buf);
+        tk.text = buf;
         return tk;
     }
 
-    // identifier or keyword or bool or type
+    if (c == '\'') {
+        srcpos++; // skip '
+        int ch;
+        if (peekc() == '\\') {
+            srcpos++; // skip backslash
+            ch = parse_escape_char();
+        } else {
+            ch = getc_src();
+        }
+        // expect closing '
+        if (peekc() == '\'') srcpos++; else { /* tolerate missing */ }
+        tk.kind = TOK_CHAR;
+        tk.cval = ch;
+        return tk;
+    }
+
     if (isalpha((unsigned char)c) || c == '_') {
         size_t a = srcpos;
         srcpos++;
@@ -130,7 +157,6 @@ static Token next_token() {
         return tk;
     }
 
-    // number literal (integer only for now)
     if (isdigit((unsigned char)c) || (c=='-' && srcpos+1 < srclen && isdigit((unsigned char)src[srcpos+1]))) {
         size_t a = srcpos;
         if (src[srcpos] == '-') srcpos++;
@@ -142,7 +168,6 @@ static Token next_token() {
         return tk;
     }
 
-    // unknown -> skip one char and return unknown
     srcpos++;
     tk.kind = TOK_UNKNOWN;
     return tk;
@@ -150,13 +175,14 @@ static Token next_token() {
 
 /* ---------- parser structures ---------- */
 
-typedef enum { VAL_INT, VAL_BOOL, VAL_STRING } ValKind;
+typedef enum { VAL_INT, VAL_BOOL, VAL_STRING, VAL_CHAR } ValKind;
 
 typedef struct Value {
     ValKind kind;
     long  ival;
     int   bval;
     char *sval;
+    int   cval;
 } Value;
 
 typedef struct Field {
@@ -199,12 +225,13 @@ static int accept(TokenKind k) {
     return P.cur.kind == k;
 }
 
-static char* token_kind(TokenKind token) {
-    switch (token) {
+static char* token_type(TokenKind k) {
+    switch (k) {
         case TOK_EOF: return "EOF";
         case TOK_IDENT: return "IDENT";
         case TOK_INT: return "INT";
         case TOK_STRING: return "STRING";
+        case TOK_CHAR: return "CHAR";
         case TOK_BOOL: return "BOOL";
         case TOK_LBRACE: return "{";
         case TOK_RBRACE: return "}";
@@ -221,13 +248,13 @@ static char* token_kind(TokenKind token) {
 static int expect(TokenKind k, const char *msg) {
     if (!P.have_cur) advance();
     if (P.cur.kind == k) return 1;
-    fprintf(stderr, "Parse error: expected token %s but got %s %s\n", token_kind(k), token_kind(P.cur.kind), msg?msg:"");
+    fprintf(stderr, "Parse error: expected token %s but got %s. %s\n", token_type(k), token_type(P.cur.kind), msg?msg:"");
     exit(1);
 }
 
 static char *dupstr(const char *s) { return s ? strdup(s) : NULL; }
 
-/* parse a literal expression (only basic literals supported here) */
+/* parse a literal expression (supports int, bool, string, char) */
 static Value parse_literal_expr() {
     if (!P.have_cur) advance();
     Token tk = P.cur;
@@ -248,15 +275,19 @@ static Value parse_literal_expr() {
         v.sval = strdup(tk.text);
         advance();
         return v;
+    } else if (tk.kind == TOK_CHAR) {
+        v.kind = VAL_CHAR;
+        v.cval = tk.cval;
+        advance();
+        return v;
     } else {
-        fprintf(stderr, "Parse error: expected literal expression, got token kind %s\n", token_kind(tk.kind));
+        fprintf(stderr, "Parse error: expected literal expression, got token kind %s\n", token_type(tk.kind));
         exit(1);
     }
 }
 
 /* parse a typed or inferred field: [type] name = expr; */
 static Field *parse_field(int type_expected) {
-    // type_expected: 1 if we already saw a type token, 0 otherwise
     char *type = NULL;
     if (type_expected) {
         if (P.cur.kind == TOK_TYPE_INT) type = dupstr("int");
@@ -265,12 +296,8 @@ static Field *parse_field(int type_expected) {
         else if (P.cur.kind == TOK_TYPE_STRING) type = dupstr("string");
         else { fprintf(stderr, "internal parser error: unexpected type token\n"); exit(1); }
         advance();
-    } else {
-        // maybe the next token is IDENT for inferred type
-        // leave type NULL
     }
 
-    // name
     if (!P.have_cur) advance();
     if (P.cur.kind != TOK_IDENT) {
         fprintf(stderr, "Parse error: expected identifier for field name\n");
@@ -279,14 +306,11 @@ static Field *parse_field(int type_expected) {
     char *name = strdup(P.cur.text);
     advance();
 
-    // =
     expect(TOK_EQ, "after field name");
     advance();
 
-    // parse expression (literal support only)
     Value v = parse_literal_expr();
 
-    // ;
     expect(TOK_SEMI, "after field expression");
     advance();
 
@@ -301,7 +325,6 @@ static Field *parse_field(int type_expected) {
 
 /* parse block: Name { ... } */
 static Block *parse_block() {
-    // expect identifier
     if (!P.have_cur) advance();
     if (P.cur.kind != TOK_IDENT) {
         fprintf(stderr, "Parse error: expected block name identifier\n");
@@ -321,7 +344,6 @@ static Block *parse_block() {
 
     Field *lastf = NULL;
 
-    // inside block
     while (1) {
         if (!P.have_cur) advance();
         if (P.cur.kind == TOK_RBRACE) {
@@ -333,7 +355,6 @@ static Block *parse_block() {
             exit(1);
         }
 
-        // could be typed field or inferred field or nested block (not implemented)
         if (P.cur.kind == TOK_TYPE_INT || P.cur.kind == TOK_TYPE_FLOAT ||
             P.cur.kind == TOK_TYPE_BOOL || P.cur.kind == TOK_TYPE_STRING) {
             Field *f = parse_field(1);
@@ -341,7 +362,6 @@ static Block *parse_block() {
             lastf = f;
             continue;
         }
-        // inferred: ident = expr;
         if (P.cur.kind == TOK_IDENT) {
             Field *f = parse_field(0);
             if (!blk->fields) blk->fields = f; else lastf->next = f;
@@ -368,7 +388,6 @@ static Block *parse_all() {
             last = b;
             continue;
         }
-        // skip unexpected tokens
         fprintf(stderr, "Parse error: expected top-level block name\n");
         exit(1);
     }
@@ -382,6 +401,14 @@ static void print_value(const Value *v) {
         case VAL_INT: printf("%ld", v->ival); break;
         case VAL_BOOL: printf(v->bval ? "true" : "false"); break;
         case VAL_STRING: printf("\"%s\"", v->sval ? v->sval : ""); break;
+        case VAL_CHAR:
+            if (v->cval == '\n') printf("'\\n'");
+            else if (v->cval == '\t') printf("'\\t'");
+            else if (v->cval == '\r') printf("'\\r'");
+            else if (v->cval == '\\') printf("'\\\\'");
+            else if (v->cval == '\'') printf("'\\''");
+            else printf("'%c'", (char)v->cval);
+            break;
         default: printf("<unknown>"); break;
     }
 }
@@ -424,7 +451,6 @@ int main(int argc, char **argv) {
         text = read_file(argv[1]);
         if (!text) { fprintf(stderr, "Failed to read %s\n", argv[1]); return 1; }
     } else {
-        // read stdin
         size_t cap = 4096; size_t len = 0;
         text = malloc(cap);
         if (!text) return 1;
@@ -445,8 +471,6 @@ int main(int argc, char **argv) {
 
     print_blocks(root);
 
-    // simple free (not exhaustive)
-    // free blocks
     for (Block *b = root; b; ) {
         Block *nb = b->next;
         free(b->name);
