@@ -870,100 +870,98 @@ static Field *find_field_in_block(Block *blk, const char *name) {
    Ambiguities favor first match. depth limits prevent runaway recursion. */
 static int resolve_ref_to_value(const Block *root_list, const Block *current_block, const Ref *r, Value *out, int depth) {
     if (!r || !out) return 0;
-    if (depth > 64) return 0; /* prevent runaway */
+    if (depth > 64) return 0;
 
-    /* helper: descend segments starting from a block pointer.
-       If at final segment and it's a field name, return that field's value.
-       If at a segment that's an index [label], pick child with same name and label.
-       We allow mixing: after selecting child block, continue descending.
-    */
-    /* We'll implement navigation as follows:
-       - For GLOBAL: start at top-level blocks (root_list) and find first block matching first segment name.
-       - For LOCAL: start at current_block.
-       - For PARENT: ascend parent_levels from current_block then proceed.
-    */
-
-    /* copy out to zero */
     memset(out, 0, sizeof(*out));
 
-    /* get starting block */
-    const Block *pos_blk = NULL;
+    /* helper: copy field value into out if found */
+    int try_field_copy(const Block *blk, const char *field_name) {
+        if (!blk || !field_name) return 0;
+        Field *f = find_field_in_block((Block *)blk, field_name);
+        if (!f) return 0;
+        *out = value_deep_copy(&f->value);
+        return 1;
+    }
+
+    /* start position */
+    const Block *pos = NULL;
     RefSeg *seg = r->head;
+
     if (r->scope == REF_GLOBAL) {
-        /* first segment must be present and be name */
-        if (!seg) return 0;
-        /* find top-level block by name = seg->name */
-        Block *b = (Block *)root_list;
+        /* global: first segment must be a name (not index) */
+        if (!seg || seg->is_index) return 0;
+        /* find top-level block with that name (scan root_list linked list) */
+        const Block *b = root_list;
         while (b) {
-            if (b->name && seg->is_index == 0 && seg->name && strcmp(b->name, seg->name) == 0) { pos_blk = b; break; }
+            if (b->name && seg->name && strcmp(b->name, seg->name) == 0) { pos = b; break; }
             b = b->next;
         }
-        if (!pos_blk) return 0;
-        seg = seg->next;
+        if (!pos) return 0;
+        seg = seg->next; /* consumed first name */
     } else if (r->scope == REF_LOCAL) {
         if (!current_block) return 0;
-        pos_blk = current_block;
-        /* first segment already stored in head; do not skip it */
-    } else if (r->scope == REF_PARENT) {
+        pos = current_block;
+    } else { /* REF_PARENT */
         if (!current_block) return 0;
-        pos_blk = current_block;
-        int levels = r->parent_levels;
-        for (int i = 0; i < levels; ++i) {
-            if (!pos_blk->parent) { pos_blk = NULL; break; }
-            pos_blk = pos_blk->parent;
+        pos = current_block;
+        for (int i = 0; i < r->parent_levels; ++i) {
+            if (!pos->parent) { pos = NULL; break; }
+            pos = pos->parent;
         }
-        if (!pos_blk) return 0;
-        /* first segment is in head; do not skip it */
+        if (!pos) return 0;
     }
 
-    /* Now iterate segments seg (if global we advanced past first) but for local/parent we start at head */
-    RefSeg *curseg = (r->scope == REF_GLOBAL) ? seg : r->head;
-    while (curseg) {
-        if (!pos_blk) return 0;
-        /* if segment is an index, it applies to child blocks with same name as previous segment:
-           but when index appears as first in a local/global path (unlikely), treat as selecting child whose label matches for any child name.
-           We'll assume index always follows a name; handle best-effort: if index present but no prior name context, scan children for any with label.
-        */
-        if (curseg->is_index) {
-            /* choose first child with matching label; if previous step left us at a specific child group name, try to match that name, otherwise pick first child with label */
-            Block *found = NULL;
-            for (Block *c = (Block *)pos_blk->children; c; c = c->next) {
-                if (c->label && curseg->index && strcmp(c->label, curseg->index) == 0) { found = c; break; }
+    /* Walk remaining segments */
+    while (seg) {
+        if (!pos) return 0;
+
+        if (seg->is_index) {
+            /* index selects first child with matching label */
+            const Block *found = NULL;
+            for (const Block *c = pos->children; c; c = c->next) {
+                if (c->label && seg->index && strcmp(c->label, seg->index) == 0) { found = c; break; }
             }
-            pos_blk = found;
-            curseg = curseg->next;
+            pos = found;
+            seg = seg->next;
             continue;
-        } else {
-            /* named segment: look for child block with that name */
-            Block *child = find_child_by_name((Block *)pos_blk, curseg->name);
-            if (child) {
-                pos_blk = child;
-                curseg = curseg->next;
-                continue;
-            } else {
-                /* no child with that name; maybe this named segment is actually a field in the current block (only if it's the final segment) */
-                if (curseg->next == NULL) {
-                    /* final segment: try field lookup in pos_blk */
-                    Field *f = find_field_in_block((Block *)pos_blk, curseg->name);
-                    if (f) {
-                        /* return deep copy of field value */
-                        *out = value_deep_copy(&f->value);
-                        return 1;
-                    } else {
-                        return 0;
-                    }
-                } else {
-                    /* intermediate named segment but no child found -> fail */
-                    return 0;
+        }
+
+        /* seg is a name */
+        RefSeg *next = seg->next;
+        if (next && next->is_index) {
+            /* name + index: select child by (name, label) */
+            const char *lbl = next->index;
+            const Block *found = NULL;
+            for (const Block *c = pos->children; c; c = c->next) {
+                if (c->name && seg->name && strcmp(c->name, seg->name) == 0) {
+                    if (c->label && lbl && strcmp(c->label, lbl) == 0) { found = c; break; }
                 }
             }
+            pos = found;
+            seg = next->next; /* consumed both */
+            continue;
+        } else {
+            /* name only: pick first child block with that name */
+            const Block *child = NULL;
+            for (const Block *c = pos->children; c; c = c->next) {
+                if (c->name && seg->name && strcmp(c->name, seg->name) == 0) { child = c; break; }
+            }
+            if (child) {
+                pos = child;
+                seg = seg->next;
+                continue;
+            }
+            /* no child found; if this is final segment, treat as field name in pos */
+            if (seg->next == NULL) {
+                if (try_field_copy(pos, seg->name)) return 1;
+                return 0;
+            }
+            /* intermediate named segment not found -> fail */
+            return 0;
         }
     }
 
-    /* If we consumed all segments and ended on a block, the reference may refer to the block itself — not a value.
-       Common use is referring to a field, so if ended on a block, resolution fails unless we look for a special convention (not implemented).
-       We'll fail in that case.
-    */
+    /* If we consumed all segments and ended on a block, that's not a field value -> fail */
     return 0;
 }
 
