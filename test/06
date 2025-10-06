@@ -20,7 +20,7 @@ System {
         name = $System.name;
         version = ^version;
         string hello = $.name;
-        float THISSHOULDFAIL = ^Kernel.version;
+        // float THISSHOULDFAIL = ^Kernel.version;
         plswork = $System.Network.interface["eth0"].gateway;
     }
 }

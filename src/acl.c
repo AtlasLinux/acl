@@ -1,10 +1,10 @@
 // parser.c
-// Single-file ACL2-like visual spec parser with reference parsing and resolution.
+// Single-file ACL parser with reference parsing and resolution.
 // References parsed: $Path.to.field, $.local.field, ^field (with repeated '^'), and ["name"] indexing.
 // After parsing the AST, resolve_all_refs(root) is called to replace resolvable VAL_REF
 // values with deep-copied resolved literal values. Ambiguous matches favor the first.
 //
-// Build: gcc -std=c11 -O2 -Wall -Wextra -o parser parser.c
+// Build: gcc -std=c11 -O2 -Wall -Wextra -o acl src/acl.c
 
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -37,6 +37,7 @@ typedef enum {
     TOK_EOF,
     TOK_IDENT,
     TOK_INT_LITERAL,
+    TOK_FLOAT_LITERAL,
     TOK_STRING,
     TOK_CHAR,
     TOK_BOOL_LITERAL,
@@ -57,6 +58,7 @@ typedef enum {
     TOK_TYPE_FLOAT,
     TOK_TYPE_BOOL,
     TOK_TYPE_STRING,
+    TOK_TYPE_REF,
 
     TOK_UNKNOWN
 } TokenKind;
@@ -65,6 +67,7 @@ typedef struct {
     TokenKind kind;
     char *text;    /* owned for identifiers/strings */
     long  ival;
+    double fval;
     int   bval;
     int   cval;
     size_t pos;
@@ -182,21 +185,35 @@ static Token next_token_internal(void) {
         if (strcmp(id, "string") == 0) { free(id); tk.kind = TOK_TYPE_STRING; return tk; }
         if (strcmp(id, "true") == 0) { free(id); tk.kind = TOK_BOOL_LITERAL; tk.bval = 1; return tk; }
         if (strcmp(id, "false") == 0) { free(id); tk.kind = TOK_BOOL_LITERAL; tk.bval = 0; return tk; }
+        if (strcmp(id, "ref") == 0) { free(id); tk.kind = TOK_TYPE_REF; return tk; }
 
         tk.kind = TOK_IDENT; tk.text = id; return tk;
     }
 
-    /* integer literal (simple) */
+    /* number literal: either int or float (simple) */
     if (isdigit((unsigned char)c) || (c == '-' && SRC_POS+1 < SRC_LEN && isdigit((unsigned char)SRC[SRC_POS+1]))) {
         size_t a = SRC_POS;
         if (peekc() == '-') getc_src();
+        /* integer part */
         while (SRC_POS < SRC_LEN && isdigit((unsigned char)peekc())) getc_src();
-        size_t b = SRC_POS;
-        char *num = substr_dup(SRC, a, b);
-        tk.kind = TOK_INT_LITERAL;
-        tk.ival = strtol(num, NULL, 10);
-        free(num);
-        return tk;
+        /* fractional part? */
+        if (peekc() == '.') {
+            getc_src();
+            while (SRC_POS < SRC_LEN && isdigit((unsigned char)peekc())) getc_src();
+            size_t b = SRC_POS;
+            char *num = substr_dup(SRC, a, b);
+            tk.kind = TOK_FLOAT_LITERAL;
+            tk.fval = strtod(num, NULL);
+            free(num);
+            return tk;
+        } else {
+            size_t b = SRC_POS;
+            char *num = substr_dup(SRC, a, b);
+            tk.kind = TOK_INT_LITERAL;
+            tk.ival = strtol(num, NULL, 10);
+            free(num);
+            return tk;
+        }
     }
 
     /* unknown char */
@@ -346,12 +363,13 @@ typedef struct {
 } Ref;
 
 /* Value kinds (extended with VAL_REF and VAL_ARRAY) */
-typedef enum { VAL_INT, VAL_BOOL, VAL_STRING, VAL_CHAR, VAL_ARRAY, VAL_REF } ValKind;
+typedef enum { VAL_INT, VAL_FLOAT, VAL_BOOL, VAL_STRING, VAL_CHAR, VAL_ARRAY, VAL_REF } ValKind;
 
 typedef struct ValueItem ValueItem;
 typedef struct Value {
     ValKind kind;
     long  ival;
+    double fval;
     int   bval;
     char *sval;
     int   cval;
@@ -367,6 +385,7 @@ typedef struct ValueItem { Value v; struct ValueItem *next; } ValueItem;
 
 
 static Value make_int(long x) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_INT; v.ival = x; return v; }
+static Value make_float(double x) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_FLOAT; v.fval = x; return v; }
 static Value make_bool(int b) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_BOOL; v.bval = b?1:0; return v; }
 static Value make_string_owned(char *s) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_STRING; v.sval = s; return v; }
 static Value make_char(int c) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_CHAR; v.cval = c; return v; }
@@ -478,6 +497,7 @@ static void print_value(const Value *v) {
     if (!v) return;
     switch (v->kind) {
         case VAL_INT: printf("%ld", v->ival); break;
+        case VAL_FLOAT: printf("%g", v->fval); break;
         case VAL_BOOL: printf(v->bval ? "true" : "false"); break;
         case VAL_STRING: printf("\"%s\"", v->sval ? v->sval : ""); break;
         case VAL_CHAR:
@@ -638,6 +658,12 @@ static Value parse_literal_value_final(void) {
         token_free(&tk);
         return v;
     }
+    if (t.kind == TOK_FLOAT_LITERAL) {
+        Token tk = take_token();
+        Value v = make_float(tk.fval);
+        token_free(&tk);
+        return v;
+    }
     if (t.kind == TOK_BOOL_LITERAL) {
         Token tk = take_token();
         Value v = make_bool(tk.bval);
@@ -695,6 +721,7 @@ static Field *parse_field_from_type_token(TokenKind tk_type) {
     else if (tk_type == TOK_TYPE_FLOAT) type_name = "float";
     else if (tk_type == TOK_TYPE_BOOL) type_name = "bool";
     else if (tk_type == TOK_TYPE_STRING) type_name = "string";
+    else if (tk_type == TOK_TYPE_REF) type_name = "ref";
     consume_token(); /* consume type token */
 
     /* optional [] after type token */
@@ -825,11 +852,13 @@ static Value value_deep_copy(const Value *v) {
     r.ival = v->ival;
     r.bval = v->bval;
     r.cval = v->cval;
+    r.fval = v->fval;
     r.sval = NULL;
     r.arr = NULL;
     r.arr_len = 0;
     r.ref = NULL;
     if (v->kind == VAL_STRING && v->sval) r.sval = str_dup_local(v->sval);
+    if (v->kind == VAL_FLOAT) r.fval = v->fval;
     if (v->kind == VAL_ARRAY) {
         ValueItem *it = v->arr;
         while (it) {
