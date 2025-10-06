@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include "acl.h"
 
 /* ---------- small helpers ---------- */
@@ -1215,4 +1216,261 @@ void acl_error_free(AclError *err) {
     if (!err) return;
     if (err->message) free(err->message);
     free(err);
+}
+
+/* ---------------------------
+   Array-index aware path lookup
+   ---------------------------
+   Supports segments like:
+     name
+     name["label"]
+     name[123]        -> numeric index selecting array element
+     ["label"]
+   Final segment may be a field with optional numeric index, e.g. field[2]
+*/
+
+/* Parse a segment string (portion between dots) and return:
+   - out_name: malloc'd identifier or NULL
+   - out_label: malloc'd label string from quoted form or NULL
+   - out_index: >=0 if numeric index present, -1 if not
+   On success returns 1 and leaves *endp at end of segment string; returns 0 on parse error.
+*/
+static int parse_segment_with_index(const char *seg, char **out_name, char **out_label, int *out_index) {
+    *out_name = NULL; *out_label = NULL; *out_index = -1;
+    const char *s = seg;
+    /* skip leading whitespace */
+    while (*s && isspace((unsigned char)*s)) s++;
+
+    /* optional name */
+    if (*s && (isalpha((unsigned char)*s) || *s == '_')) {
+        const char *a = s++;
+        while (*s && (isalnum((unsigned char)*s) || *s == '_')) s++;
+        size_t n = (size_t)(s - a);
+        *out_name = malloc(n + 1);
+        if (!*out_name) return 0;
+        memcpy(*out_name, a, n);
+        (*out_name)[n] = '\0';
+    }
+
+    /* skip whitespace */
+    while (*s && isspace((unsigned char)*s)) s++;
+
+    /* zero or more indexers allowed; we only use the first meaningful one:
+       - ["label"]  -> set out_label
+       - [digits]   -> set out_index
+       If multiple are present (e.g., name["a"][0]) this parser treats the first index here;
+       the lookup routine consumes segments in order so multi-indexing across path segments should
+       be expressed using separate segments if needed.
+    */
+    if (*s == '[') {
+        s++;
+        while (*s && isspace((unsigned char)*s)) s++;
+        if (*s == '"') {
+            /* label index */
+            s++;
+            const char *q = s;
+            while (*q && *q != '"') q++;
+            if (*q != '"') { if (*out_name) free(*out_name); return 0; }
+            size_t len = (size_t)(q - s);
+            *out_label = malloc(len + 1);
+            if (!*out_label) { if (*out_name) free(*out_name); return 0; }
+            memcpy(*out_label, s, len);
+            (*out_label)[len] = '\0';
+            s = q + 1;
+            while (*s && isspace((unsigned char)*s)) s++;
+            if (*s != ']') { if (*out_name) free(*out_name); free(*out_label); *out_label = NULL; return 0; }
+            s++;
+        } else if (isdigit((unsigned char)*s)) {
+            /* numeric index */
+            char *endptr = NULL;
+            long idx = strtol(s, &endptr, 10);
+            if (endptr == s) { if (*out_name) free(*out_name); return 0; }
+            if (idx < 0) { if (*out_name) free(*out_name); return 0; }
+            *out_index = (int)idx;
+            s = endptr;
+            while (*s && isspace((unsigned char)*s)) s++;
+            if (*s != ']') { if (*out_name) free(*out_name); return 0; }
+            s++;
+        } else {
+            /* unsupported indexer content */
+            if (*out_name) free(*out_name);
+            return 0;
+        }
+    }
+
+    /* skip trailing whitespace */
+    while (*s && isspace((unsigned char)*s)) s++;
+
+    /* success if we've consumed full seg (caller ensures seg is exact substring) */
+    return 1;
+}
+
+/* Find a Value* given a path with optional numeric indexing.
+   Returns pointer to Value inside tree (do not free) or NULL if not found/parse error.
+*/
+AclValue *acl_find_value_by_path(AclBlock *root, const char *path) {
+    if (!root || !path) return NULL;
+    const char *p = path;
+    Block *cur_block = NULL;
+    Block *top = (Block*)root;
+
+    while (*p) {
+        /* find next '.' separating segments (not inside brackets) */
+        int in_br = 0;
+        const char *q = p;
+        while (*q) {
+            if (*q == '[') in_br = 1;
+            else if (*q == ']') in_br = 0;
+            else if (!in_br && *q == '.') break;
+            q++;
+        }
+        size_t seglen = (size_t)(q - p);
+        if (seglen == 0) return NULL;
+        char *seg = malloc(seglen + 1);
+        if (!seg) return NULL;
+        memcpy(seg, p, seglen); seg[seglen] = '\0';
+
+        char *name = NULL;
+        char *label = NULL;
+        int index = -1;
+        if (!parse_segment_with_index(seg, &name, &label, &index)) {
+            free(seg); if (name) free(name); if (label) free(label); return NULL;
+        }
+        free(seg);
+
+        int is_final = (*q == '\0');
+
+        if (!cur_block) {
+            /* selecting a top-level block */
+            if (name) {
+                /* find first top-level block with matching name */
+                Block *b = top;
+                while (b) {
+                    if (b->name && strcmp(b->name, name) == 0) { cur_block = b; break; }
+                    b = b->next;
+                }
+                if (!cur_block) { free(name); if (label) free(label); return NULL; }
+                /* if label present select child with that label under this block name (rare at top-level) */
+                if (label) {
+                    Block *found = find_child_by_name_and_label(cur_block, name, label);
+                    if (found) cur_block = found;
+                    else { free(name); free(label); return NULL; }
+                }
+            } else {
+                /* no name, label provided: find first top-level block with matching label */
+                Block *b = top;
+                while (b) {
+                    if (b->label && label && strcmp(b->label, label) == 0) { cur_block = b; break; }
+                    b = b->next;
+                }
+                if (!cur_block) { if (label) free(label); return NULL; }
+            }
+        } else {
+            if (is_final) {
+                /* final segment: must refer to a field name (name != NULL).
+                   If index >=0 then we want an element inside an array field.
+                */
+                if (!name) { if (label) free(label); if (name) free(name); return NULL; }
+                Field *f = find_field_in_block(cur_block, name);
+                if (!f) { free(name); if (label) free(label); return NULL; }
+                free(name); if (label) free(label);
+                if (index < 0) {
+                    return (AclValue*)&f->value;
+                } else {
+                    /* field must be array and index in-bounds; return pointer to element Value */
+                    if (f->value.kind != VAL_ARRAY) return NULL;
+                    if ((size_t)index >= f->value.arr_len) return NULL;
+                    ValueItem *it = f->value.arr;
+                    for (int i = 0; i < index; ++i) it = it->next;
+                    return (AclValue*)&it->v;
+                }
+            } else {
+                /* intermediate segment: select child block by name/label, or if name refers to a child array block? */
+                Block *next = NULL;
+                if (label && name) {
+                    next = find_child_by_name_and_label(cur_block, name, label);
+                } else if (label && !name) {
+                    /* choose first child whose label matches */
+                    for (Block *c = cur_block->children; c; c = c->next) {
+                        if (c->label && strcmp(c->label, label) == 0) { next = c; break; }
+                    }
+                } else if (name && !label) {
+                    /* first child with that name */
+                    next = find_child_by_name(cur_block, name);
+                }
+                if (!next) { free(name); if (label) free(label); return NULL; }
+                cur_block = next;
+
+                /* if an index was provided on an intermediate segment, interpret it as:
+                   select the Nth child with that name (0-based). This is a convenience:
+                     foo.bar[1].baz
+                   will select the second child block named "bar" under foo.
+                */
+                if (index >= 0) {
+                    /* walk children and select nth matching name */
+                    int seen = 0;
+                    Block *sel = NULL;
+                    for (Block *c = cur_block->parent ? cur_block->parent->children : top; c; c = c->next) {
+                        if (c->name && name && strcmp(c->name, name) == 0) {
+                            if (seen == index) { sel = c; break; }
+                            seen++;
+                        }
+                    }
+                    if (!sel) { if (name) free(name); if (label) free(label); return NULL; }
+                    cur_block = sel;
+                }
+            }
+        }
+
+        if (name) free(name);
+        if (label) free(label);
+        p = q;
+        if (*p == '.') p++;
+    }
+
+    return NULL;
+}
+
+/* Updated typed getters that use the above function.
+   These return 1 on success, 0 otherwise.
+*/
+
+int acl_get_int(AclBlock *root, const char *path, long *out) {
+    if (!out) return 0;
+    AclValue *pv = acl_find_value_by_path(root, path);
+    if (!pv) return 0;
+    Value *v = (Value*)pv;
+    if (v->kind == VAL_INT) { *out = v->ival; return 1; }
+    return 0;
+}
+
+int acl_get_float(AclBlock *root, const char *path, double *out) {
+    if (!out) return 0;
+    AclValue *pv = acl_find_value_by_path(root, path);
+    if (!pv) return 0;
+    Value *v = (Value*)pv;
+    if (v->kind == VAL_FLOAT) { *out = v->fval; return 1; }
+    if (v->kind == VAL_INT) { *out = (double)v->ival; return 1; }
+    return 0;
+}
+
+int acl_get_bool(AclBlock *root, const char *path, int *out) {
+    if (!out) return 0;
+    AclValue *pv = acl_find_value_by_path(root, path);
+    if (!pv) return 0;
+    Value *v = (Value*)pv;
+    if (v->kind == VAL_BOOL) { *out = v->bval; return 1; }
+    return 0;
+}
+
+int acl_get_string(AclBlock *root, const char *path, char **out) {
+    if (!out) return 0;
+    AclValue *pv = acl_find_value_by_path(root, path);
+    if (!pv) return 0;
+    Value *v = (Value*)pv;
+    if (v->kind == VAL_STRING && v->sval) {
+        *out = str_dup_local(v->sval);
+        return *out != NULL;
+    }
+    return 0;
 }

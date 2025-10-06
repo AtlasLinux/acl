@@ -38,4 +38,21 @@ struct AclError {
 };
 void acl_error_free(AclError *err);
 
+/* Path lookup that supports numeric array indexing.
+   Examples:
+     "Modules.load[0]"
+     "Network.interface[\"eth0\"].gateway"
+     "Network.interface[\"wlan0\"].addresses[2]"
+
+   Returns pointer-owned Value* (pointer into the tree) or NULL if not found.
+   Do not free the returned pointer; its lifetime is tied to the acl tree.
+*/
+AclValue *acl_find_value_by_path(AclBlock *root, const char *path);
+
+/* Typed getters now use array-index aware lookup (same behavior as before) */
+int acl_get_int(AclBlock *root, const char *path, long *out);
+int acl_get_float(AclBlock *root, const char *path, double *out);
+int acl_get_bool(AclBlock *root, const char *path, int *out);
+int acl_get_string(AclBlock *root, const char *path, char **out);
+
 #endif
