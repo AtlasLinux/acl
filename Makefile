@@ -1,6 +1,7 @@
 all:
 	@mkdir -p build
-	@gcc -Wall -Wextra -o build/acl src/acl.c -Wno-unused-function -std=c11
+	@gcc -std=c11 -O2 -Wall -Wextra -fPIC -shared -o build/libacl.so src/acl.c
+	@gcc -o build/acl src/test.c -Lbuild -lacl
 
 clean:
 	@rm -rf build

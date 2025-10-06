@@ -1,16 +1,14 @@
-// parser.c
-// Single-file ACL parser with reference parsing and resolution.
-// References parsed: $Path.to.field, $.local.field, ^field (with repeated '^'), and ["name"] indexing.
-// After parsing the AST, resolve_all_refs(root) is called to replace resolvable VAL_REF
-// values with deep-copied resolved literal values. Ambiguous matches favor the first.
-//
-// Build: gcc -std=c11 -O2 -Wall -Wextra -o acl src/acl.c
+/* acl_lib.c
+   Single-file ACL parser library wrapper.
+   Compile: gcc -std=c11 -O2 -Wall -Wextra -shared -fPIC -o libacl.so acl_lib.c
+*/
 
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "acl.h"
 
 /* ---------- small helpers ---------- */
 
@@ -819,7 +817,7 @@ static Block *parse_block_recursive(Block *parent) {
 
 /* ---------- top-level parse ---------- */
 
-static Block *parse_all(const char *text) {
+Block *parse_all(const char *text) {
     SRC = text;
     SRC_POS = 0;
     SRC_LEN = strlen(SRC);
@@ -1059,7 +1057,7 @@ static int try_resolve_value_for_field(const Block *root_list, Block *field_bloc
 
 /* Walk tree and resolve all field VAL_REF values, using containing block as context.
    This is iterative but will attempt to resolve nested references by multiple passes up to a limit. */
-static void resolve_all_refs(Block *root) {
+void resolve_all_refs(Block *root) {
     if (!root) return;
     /* gather list of blocks for easy traversal (top-down) */
     /* We'll perform multiple passes until no changes or max passes reached */
@@ -1114,7 +1112,7 @@ static void resolve_all_refs(Block *root) {
 /* ---------- printing/freeing ---------- */
 
 static void print_block(const Block *b, int indent);
-static void print_all(const Block *root) {
+void print_all(const Block *root) {
     for (const Block *b = root; b; b = b->next) {
         print_block(b, 0);
         printf("\n");
@@ -1136,7 +1134,7 @@ static void print_block(const Block *b, int indent) {
     for (const Block *c = b->children; c; c = c->next) print_block(c, indent+1);
 }
 
-static void free_blocks(Block *b) {
+void free_blocks(Block *b) {
     while (b) {
         Block *nb = b->next;
         if (b->name) free(b->name);
@@ -1155,33 +1153,72 @@ static void free_blocks(Block *b) {
     }
 }
 
-/* ---------- main ---------- */
+/* Forward declarations of parser internals (defined in the pasted code below) */
+extern struct Block; /* opaque here; actual definition comes from pasted code */
+typedef struct Block Block;
 
-int main(int argc, char **argv) {
-    char *text = NULL;
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <input-file>\n", argv[0]);
-        return 1;
-    }
-    const char *fn = argv[1];
-    FILE *f = fopen(fn, "rb");
-    if (!f) { perror("fopen"); return 1; }
-    fseek(f, 0, SEEK_END);
+/* The following externs must match the functions in your pasted parser source. */
+extern Block *parse_all(const char *text);
+extern void resolve_all_refs(Block *root);
+extern void print_all(const Block *root);
+extern void free_blocks(Block *root);
+
+/* -----------------------------
+   Public API wrappers
+   ----------------------------- */
+
+int acl_init(void) {
+    /* No global init required for current implementation */
+    return 1;
+}
+void acl_shutdown(void) {
+    /* No-op for now */
+}
+
+AclBlock *acl_parse_file(const char *path) {
+    if (!path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror("fopen"); return NULL; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    text = malloc(sz+1);
-    if (!text) { fclose(f); return 1; }
-    if (fread(text, 1, sz, f) != (size_t)sz) { fclose(f); free(text); return 1; }
-    text[sz] = '\0';
+    if (sz < 0) { fclose(f); return NULL; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return NULL; }
+    buf[sz] = '\0';
     fclose(f);
 
+    Block *root = parse_all(buf);
+    free(buf);
+    return (AclBlock*)root;
+}
+
+AclBlock *acl_parse_string(const char *text) {
+    if (!text) return NULL;
     Block *root = parse_all(text);
+    return (AclBlock*)root;
+}
 
-    /* resolve references in-place */
-    resolve_all_refs(root);
+int acl_resolve_all(AclBlock *root) {
+    if (!root) return 0;
+    resolve_all_refs((Block*)root);
+    return 1;
+}
 
-    print_all(root);
-    free_blocks(root);
-    free(text);
-    return 0;
+void acl_print(AclBlock *root, FILE *out) {
+    (void)out;
+    if (!root) return;
+    print_all((Block*)root);
+}
+
+void acl_free(AclBlock *root) {
+    if (!root) return;
+    free_blocks((Block*)root);
+}
+
+void acl_error_free(AclError *err) {
+    if (!err) return;
+    if (err->message) free(err->message);
+    free(err);
 }
