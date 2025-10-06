@@ -1,8 +1,8 @@
 // parser.c
-// Single-file ACL2-like visual spec parser (no expressions).
-// Sub-block detection via safe lookahead snapshot.
-// Supports nested sub-blocks with optional string labels, typed and inferred fields,
-// literal values: int, bool, string, char, arrays, comments, improved errors.
+// Single-file ACL2-like visual spec parser with reference parsing and resolution.
+// References parsed: $Path.to.field, $.local.field, ^field (with repeated '^'), and ["name"] indexing.
+// After parsing the AST, resolve_all_refs(root) is called to replace resolvable VAL_REF
+// values with deep-copied resolved literal values. Ambiguous matches favor the first.
 //
 // Build: gcc -std=c11 -O2 -Wall -Wextra -o parser parser.c
 
@@ -48,6 +48,10 @@ typedef enum {
     TOK_COMMA,
     TOK_LBRACK,
     TOK_RBRACK,
+
+    TOK_DOLLAR,
+    TOK_DOT,
+    TOK_CARET,
 
     TOK_TYPE_INT,
     TOK_TYPE_FLOAT,
@@ -123,6 +127,7 @@ static Token next_token_internal(void) {
     if (SRC_POS >= SRC_LEN) { tk.kind = TOK_EOF; return tk; }
     char c = peekc();
 
+    /* punctuation */
     if (c == '{') { getc_src(); tk.kind = TOK_LBRACE; return tk; }
     if (c == '}') { getc_src(); tk.kind = TOK_RBRACE; return tk; }
     if (c == '=') { getc_src(); tk.kind = TOK_EQ; return tk; }
@@ -130,7 +135,11 @@ static Token next_token_internal(void) {
     if (c == ',') { getc_src(); tk.kind = TOK_COMMA; return tk; }
     if (c == '[') { getc_src(); tk.kind = TOK_LBRACK; return tk; }
     if (c == ']') { getc_src(); tk.kind = TOK_RBRACK; return tk; }
+    if (c == '$') { getc_src(); tk.kind = TOK_DOLLAR; return tk; }
+    if (c == '.') { getc_src(); tk.kind = TOK_DOT; return tk; }
+    if (c == '^') { getc_src(); tk.kind = TOK_CARET; return tk; }
 
+    /* string literal */
     if (c == '"') {
         getc_src();
         size_t cap = 128, len = 0;
@@ -150,6 +159,7 @@ static Token next_token_internal(void) {
         return tk;
     }
 
+    /* char literal */
     if (c == '\'') {
         getc_src();
         int ch;
@@ -159,6 +169,7 @@ static Token next_token_internal(void) {
         return tk;
     }
 
+    /* identifier or type keyword or bool literal */
     if (isalpha((unsigned char)c) || c == '_') {
         size_t a = SRC_POS; getc_src();
         while (SRC_POS < SRC_LEN && (isalnum((unsigned char)peekc()) || peekc() == '_')) getc_src();
@@ -175,6 +186,7 @@ static Token next_token_internal(void) {
         tk.kind = TOK_IDENT; tk.text = id; return tk;
     }
 
+    /* integer literal (simple) */
     if (isdigit((unsigned char)c) || (c == '-' && SRC_POS+1 < SRC_LEN && isdigit((unsigned char)SRC[SRC_POS+1]))) {
         size_t a = SRC_POS;
         if (peekc() == '-') getc_src();
@@ -187,6 +199,7 @@ static Token next_token_internal(void) {
         return tk;
     }
 
+    /* unknown char */
     getc_src();
     tk.kind = TOK_UNKNOWN;
     return tk;
@@ -293,6 +306,7 @@ static Token peek2(void) { return peek_n_safe(2); }
 /* ---------- error reporting ---------- */
 
 static void show_line_context(size_t pos, int line, int col) {
+    (void)line; /* unused */
     size_t i = pos;
     while (i > 0 && SRC[i-1] != '\n') i--;
     size_t j = i;
@@ -316,23 +330,90 @@ static void parse_error_token(const Token *t, const char *expect) {
     exit(1);
 }
 
-/* ---------- values and AST (arrays added) ---------- */
+/* ---------- values, references, and AST ---------- */
 
-typedef enum { VAL_INT, VAL_BOOL, VAL_STRING, VAL_CHAR, VAL_ARRAY } ValKind;
-typedef struct Value Value;
+/* Reference representation */
+typedef enum { REF_GLOBAL, REF_LOCAL, REF_PARENT } RefScope;
+typedef struct RefSeg { char *name; int is_index; char *index; struct RefSeg *next; } RefSeg;
+typedef struct {
+    RefScope scope;
+    int parent_levels; /* number of ^ prefixes for parent refs (>=1) */
+    RefSeg *head;      /* linked list of segments (name or index) */
+} Ref;
+
+/* Value kinds (extended with VAL_REF and VAL_ARRAY) */
+typedef enum { VAL_INT, VAL_BOOL, VAL_STRING, VAL_CHAR, VAL_ARRAY, VAL_REF } ValKind;
+
 typedef struct ValueItem ValueItem;
-struct Value { ValKind kind; long ival; int bval; char *sval; int cval; ValueItem *arr; size_t arr_len; };
+typedef struct Value {
+    ValKind kind;
+    long  ival;
+    int   bval;
+    char *sval;
+    int   cval;
+
+    /* arrays */
+    ValueItem *arr;
+    size_t arr_len;
+
+    /* ref */
+    Ref *ref;
+} Value;
 typedef struct ValueItem { Value v; struct ValueItem *next; } ValueItem;
+
 
 static Value make_int(long x) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_INT; v.ival = x; return v; }
 static Value make_bool(int b) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_BOOL; v.bval = b?1:0; return v; }
 static Value make_string_owned(char *s) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_STRING; v.sval = s; return v; }
 static Value make_char(int c) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_CHAR; v.cval = c; return v; }
 static Value make_array(void) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_ARRAY; v.arr = NULL; v.arr_len = 0; return v; }
+static Value make_ref(Ref *r) { Value v; memset(&v,0,sizeof(v)); v.kind = VAL_REF; v.ref = r; return v; }
 
+/* helpers for ref segments */
+static RefSeg *refseg_create_name(const char *name) {
+    RefSeg *s = malloc(sizeof(*s));
+    s->name = name ? str_dup_local(name) : NULL;
+    s->is_index = 0;
+    s->index = NULL;
+    s->next = NULL;
+    return s;
+}
+static RefSeg *refseg_create_index(const char *idx) {
+    RefSeg *s = malloc(sizeof(*s));
+    s->name = NULL;
+    s->is_index = 1;
+    s->index = idx ? str_dup_local(idx) : NULL;
+    s->next = NULL;
+    return s;
+}
+static void refseg_free(RefSeg *s) {
+    while (s) {
+        RefSeg *n = s->next;
+        if (s->name) free(s->name);
+        if (s->index) free(s->index);
+        free(s);
+        s = n;
+    }
+}
+
+/* ref creation / free */
+static Ref *ref_create(RefScope scope) {
+    Ref *r = malloc(sizeof(*r));
+    r->scope = scope;
+    r->parent_levels = 0;
+    r->head = NULL;
+    return r;
+}
+static void ref_free(Ref *r) {
+    if (!r) return;
+    if (r->head) refseg_free(r->head);
+    free(r);
+}
+
+/* free Value (deep) */
 static void value_free(Value *v) {
     if (!v) return;
-    if (v->kind == VAL_STRING && v->sval) { free(v->sval); v->sval = NULL; return; }
+    if (v->kind == VAL_STRING && v->sval) { free(v->sval); v->sval = NULL; }
     if (v->kind == VAL_ARRAY) {
         ValueItem *it = v->arr;
         while (it) {
@@ -343,6 +424,9 @@ static void value_free(Value *v) {
         }
         v->arr = NULL;
         v->arr_len = 0;
+    }
+    if (v->kind == VAL_REF) {
+        if (v->ref) { ref_free(v->ref); v->ref = NULL; }
     }
 }
 
@@ -361,7 +445,30 @@ static void array_append(Value *arrv, Value item) {
     arrv->arr_len++;
 }
 
-/* ---------- printing values including arrays ---------- */
+/* ---------- printing values (including refs and arrays) ---------- */
+
+static void print_ref(const Ref *r) {
+    if (!r) { printf("<ref:null>"); return; }
+    if (r->scope == REF_GLOBAL) printf("$");
+    else if (r->scope == REF_LOCAL) printf("$."); 
+    else if (r->scope == REF_PARENT) {
+        for (int i = 0; i < r->parent_levels; ++i) printf("^");
+    }
+    RefSeg *s = r->head;
+    int first = 1;
+    while (s) {
+        if (!first && (s->is_index == 0)) {
+            printf(".");
+        }
+        if (s->is_index) {
+            printf("[\"%s\"]", s->index ? s->index : "");
+        } else {
+            printf("%s", s->name ? s->name : "");
+        }
+        first = 0;
+        s = s->next;
+    }
+}
 
 static void print_value(const Value *v) {
     if (!v) return;
@@ -387,6 +494,9 @@ static void print_value(const Value *v) {
             printf("]");
             break;
         }
+        case VAL_REF:
+            print_ref(v->ref);
+            break;
     }
 }
 
@@ -395,7 +505,94 @@ static void print_value(const Value *v) {
 typedef struct Field { char *type; char *name; Value value; struct Field *next; } Field;
 typedef struct Block { char *name; char *label; Field *fields; struct Block *children; struct Block *next; struct Block *parent; } Block;
 
-/* ---------- literal parsing (with arrays) ---------- */
+/* ---------- reference parsing helpers ---------- */
+
+/* parse path tail: .ident or ["index"] repeated; returns head RefSeg list (owned) */
+static RefSeg *parse_ref_path_segments(void) {
+    RefSeg *head = NULL;
+    RefSeg **tail = &head;
+    while (1) {
+        Token t = cur_token();
+        if (t.kind == TOK_DOT) {
+            consume_token(); /* consume '.' */
+            Token id = cur_token();
+            if (id.kind != TOK_IDENT) parse_error_token(&id, "identifier after '.' in reference");
+            Token idtok = take_token(); /* owned copy of ident */
+            RefSeg *s = refseg_create_name(idtok.text);
+            /* idtok.text transferred into s->name, do not free idtok.text below */
+            *tail = s; tail = &s->next;
+            token_free(&idtok);
+            continue;
+        } else if (t.kind == TOK_LBRACK) {
+            consume_token(); /* consume '[' */
+            Token idx = cur_token();
+            if (idx.kind != TOK_STRING) parse_error_token(&idx, "string index in reference [\"name\"]");
+            Token idxtok = take_token(); /* owns string */
+            Token rb = cur_token();
+            if (rb.kind != TOK_RBRACK) parse_error_token(&rb, "']' after string index in reference");
+            consume_token(); /* consume ']' */
+            RefSeg *s = refseg_create_index(idxtok.text);
+            *tail = s; tail = &s->next;
+            continue;
+        }
+        break;
+    }
+    return head;
+}
+
+/* parse a reference value starting at current token (handles $, $., and ^) */
+static Value parse_reference_value(void) {
+    Token t = cur_token();
+    if (t.kind == TOK_DOLLAR) {
+        consume_token(); /* consume $ */
+        Token next = cur_token();
+        Ref *r;
+        if (next.kind == TOK_DOT) {
+            /* local: $.field.path */
+            consume_token(); /* consume '.' */
+            r = ref_create(REF_LOCAL);
+            Token id = cur_token();
+            if (id.kind != TOK_IDENT) parse_error_token(&id, "identifier after '$.'");
+            Token idtok = take_token();
+            RefSeg *head = refseg_create_name(idtok.text);
+            token_free(&idtok);
+            RefSeg *rest = parse_ref_path_segments();
+            if (rest) head->next = rest;
+            r->head = head;
+            return make_ref(r);
+        } else {
+            /* global: $Name.path or $Name["label"].field... */
+            r = ref_create(REF_GLOBAL);
+            Token id = cur_token();
+            if (id.kind != TOK_IDENT) parse_error_token(&id, "identifier after '$'");
+            Token idtok = take_token();
+            RefSeg *head = refseg_create_name(idtok.text);
+            token_free(&idtok);
+            RefSeg *rest = parse_ref_path_segments();
+            if (rest) head->next = rest;
+            r->head = head;
+            return make_ref(r);
+        }
+    } else if (t.kind == TOK_CARET) {
+        int levels = 0;
+        while (cur_token().kind == TOK_CARET) { consume_token(); levels++; }
+        Ref *r = ref_create(REF_PARENT);
+        r->parent_levels = levels;
+        Token id = cur_token();
+        if (id.kind != TOK_IDENT) parse_error_token(&id, "identifier after '^' in parent reference");
+        Token idtok = take_token();
+        RefSeg *head = refseg_create_name(idtok.text);
+        token_free(&idtok);
+        RefSeg *rest = parse_ref_path_segments();
+        if (rest) head->next = rest;
+        r->head = head;
+        return make_ref(r);
+    }
+    parse_error_token(&t, "reference starting with '$' or '^'");
+    return make_int(0);
+}
+
+/* ---------- literal parsing (with arrays and refs) ---------- */
 
 static Value parse_literal_value_final(void); /* forward */
 
@@ -440,10 +637,11 @@ static Value parse_literal_value_final(void) {
         token_free(&tk);
         return v;
     }
-    if (t.kind == TOK_LBRACE) {
-        return parse_array_literal_final();
-    }
-    parse_error_token(&t, "literal (int, bool, string, char, or array)");
+    if (t.kind == TOK_LBRACE) return parse_array_literal_final();
+    if (t.kind == TOK_DOLLAR || t.kind == TOK_CARET) return parse_reference_value();
+    /* support local $. handled in parse_reference_value */
+
+    parse_error_token(&t, "literal (int, bool, string, char, array, or reference)");
     return make_int(0);
 }
 
@@ -481,7 +679,7 @@ static Field *parse_field_from_type_token(TokenKind tk_type) {
     else if (tk_type == TOK_TYPE_STRING) type_name = "string";
     consume_token(); /* consume type token */
 
-    /* optional [] after type token (we don't change runtime representation; it's a hint) */
+    /* optional [] after type token */
     Token nxt = cur_token();
     if (nxt.kind == TOK_LBRACK) {
         consume_token();
@@ -600,6 +798,245 @@ static Block *parse_all(const char *text) {
     return head;
 }
 
+/* ---------- resolution helpers ---------- */
+
+/* deep copy value (owned copy) */
+static Value value_deep_copy(const Value *v) {
+    Value r; memset(&r,0,sizeof(r));
+    r.kind = v->kind;
+    r.ival = v->ival;
+    r.bval = v->bval;
+    r.cval = v->cval;
+    r.sval = NULL;
+    r.arr = NULL;
+    r.arr_len = 0;
+    r.ref = NULL;
+    if (v->kind == VAL_STRING && v->sval) r.sval = str_dup_local(v->sval);
+    if (v->kind == VAL_ARRAY) {
+        ValueItem *it = v->arr;
+        while (it) {
+            array_append(&r, value_deep_copy(&it->v));
+            it = it->next;
+        }
+    }
+    if (v->kind == VAL_REF && v->ref) {
+        /* copy ref structure so unresolved refs remain independent */
+        Ref *rf = ref_create(v->ref->scope);
+        rf->parent_levels = v->ref->parent_levels;
+        RefSeg *src = v->ref->head;
+        RefSeg **tail = &rf->head;
+        while (src) {
+            if (src->is_index) *tail = refseg_create_index(src->index);
+            else *tail = refseg_create_name(src->name);
+            tail = &(*tail)->next;
+            src = src->next;
+        }
+        r.ref = rf;
+    }
+    return r;
+}
+
+/* find first child block of `blk` with given name (favor first) */
+static Block *find_child_by_name(Block *blk, const char *name) {
+    if (!blk) return NULL;
+    for (Block *c = blk->children; c; c = c->next) {
+        if (c->name && name && strcmp(c->name, name) == 0) return c;
+    }
+    return NULL;
+}
+
+/* find first child block of `blk` with given name and label */
+static Block *find_child_by_name_and_label(Block *blk, const char *name, const char *label) {
+    if (!blk) return NULL;
+    for (Block *c = blk->children; c; c = c->next) {
+        if (c->name && name && strcmp(c->name, name) == 0) {
+            if (c->label && label && strcmp(c->label, label) == 0) return c;
+        }
+    }
+    return NULL;
+}
+
+/* find field by name in block (favor first) */
+static Field *find_field_in_block(Block *blk, const char *name) {
+    if (!blk) return NULL;
+    for (Field *f = blk->fields; f; f = f->next) {
+        if (f->name && name && strcmp(f->name, name) == 0) return f;
+    }
+    return NULL;
+}
+
+/* resolve a Ref into a Value copy, given root list and current block context.
+   Returns 1 on success and stores copied value in out (caller must value_free), 0 on failure.
+   Ambiguities favor first match. depth limits prevent runaway recursion. */
+static int resolve_ref_to_value(const Block *root_list, const Block *current_block, const Ref *r, Value *out, int depth) {
+    if (!r || !out) return 0;
+    if (depth > 64) return 0; /* prevent runaway */
+
+    /* helper: descend segments starting from a block pointer.
+       If at final segment and it's a field name, return that field's value.
+       If at a segment that's an index [label], pick child with same name and label.
+       We allow mixing: after selecting child block, continue descending.
+    */
+    /* We'll implement navigation as follows:
+       - For GLOBAL: start at top-level blocks (root_list) and find first block matching first segment name.
+       - For LOCAL: start at current_block.
+       - For PARENT: ascend parent_levels from current_block then proceed.
+    */
+
+    /* copy out to zero */
+    memset(out, 0, sizeof(*out));
+
+    /* get starting block */
+    const Block *pos_blk = NULL;
+    RefSeg *seg = r->head;
+    if (r->scope == REF_GLOBAL) {
+        /* first segment must be present and be name */
+        if (!seg) return 0;
+        /* find top-level block by name = seg->name */
+        Block *b = (Block *)root_list;
+        while (b) {
+            if (b->name && seg->is_index == 0 && seg->name && strcmp(b->name, seg->name) == 0) { pos_blk = b; break; }
+            b = b->next;
+        }
+        if (!pos_blk) return 0;
+        seg = seg->next;
+    } else if (r->scope == REF_LOCAL) {
+        if (!current_block) return 0;
+        pos_blk = current_block;
+        /* first segment already stored in head; do not skip it */
+    } else if (r->scope == REF_PARENT) {
+        if (!current_block) return 0;
+        pos_blk = current_block;
+        int levels = r->parent_levels;
+        for (int i = 0; i < levels; ++i) {
+            if (!pos_blk->parent) { pos_blk = NULL; break; }
+            pos_blk = pos_blk->parent;
+        }
+        if (!pos_blk) return 0;
+        /* first segment is in head; do not skip it */
+    }
+
+    /* Now iterate segments seg (if global we advanced past first) but for local/parent we start at head */
+    RefSeg *curseg = (r->scope == REF_GLOBAL) ? seg : r->head;
+    while (curseg) {
+        if (!pos_blk) return 0;
+        /* if segment is an index, it applies to child blocks with same name as previous segment:
+           but when index appears as first in a local/global path (unlikely), treat as selecting child whose label matches for any child name.
+           We'll assume index always follows a name; handle best-effort: if index present but no prior name context, scan children for any with label.
+        */
+        if (curseg->is_index) {
+            /* choose first child with matching label; if previous step left us at a specific child group name, try to match that name, otherwise pick first child with label */
+            Block *found = NULL;
+            for (Block *c = (Block *)pos_blk->children; c; c = c->next) {
+                if (c->label && curseg->index && strcmp(c->label, curseg->index) == 0) { found = c; break; }
+            }
+            pos_blk = found;
+            curseg = curseg->next;
+            continue;
+        } else {
+            /* named segment: look for child block with that name */
+            Block *child = find_child_by_name((Block *)pos_blk, curseg->name);
+            if (child) {
+                pos_blk = child;
+                curseg = curseg->next;
+                continue;
+            } else {
+                /* no child with that name; maybe this named segment is actually a field in the current block (only if it's the final segment) */
+                if (curseg->next == NULL) {
+                    /* final segment: try field lookup in pos_blk */
+                    Field *f = find_field_in_block((Block *)pos_blk, curseg->name);
+                    if (f) {
+                        /* return deep copy of field value */
+                        *out = value_deep_copy(&f->value);
+                        return 1;
+                    } else {
+                        return 0;
+                    }
+                } else {
+                    /* intermediate named segment but no child found -> fail */
+                    return 0;
+                }
+            }
+        }
+    }
+
+    /* If we consumed all segments and ended on a block, the reference may refer to the block itself — not a value.
+       Common use is referring to a field, so if ended on a block, resolution fails unless we look for a special convention (not implemented).
+       We'll fail in that case.
+    */
+    return 0;
+}
+
+/* attempt to resolve a single Value if it's VAL_REF; uses block context (the block that owns the field).
+   Returns 1 if replaced (and out value is set into field), 0 if nothing changed. */
+static int try_resolve_value_for_field(const Block *root_list, Block *field_block, Value *v, int depth) {
+    if (!v) return 0;
+    if (v->kind != VAL_REF) return 0;
+    Value resolved;
+    if (resolve_ref_to_value(root_list, field_block, v->ref, &resolved, depth+1)) {
+        /* replace v with resolved (take ownership of resolved) */
+        /* free original ref */
+        value_free(v);
+        *v = resolved;
+        return 1;
+    }
+    return 0;
+}
+
+/* Walk tree and resolve all field VAL_REF values, using containing block as context.
+   This is iterative but will attempt to resolve nested references by multiple passes up to a limit. */
+static void resolve_all_refs(Block *root) {
+    if (!root) return;
+    /* gather list of blocks for easy traversal (top-down) */
+    /* We'll perform multiple passes until no changes or max passes reached */
+    const int MAX_PASSES = 16;
+    for (int pass = 0; pass < MAX_PASSES; ++pass) {
+        int any_changed = 0;
+        /* traverse all blocks */
+        Block *b = root;
+        while (b) {
+            /* traverse recursively children via stack */
+            /* We'll implement simple DFS using array stack */
+            size_t stack_cap = 64;
+            Block **stack = malloc(sizeof(Block*) * stack_cap);
+            size_t stack_len = 0;
+            stack[stack_len++] = b;
+            while (stack_len) {
+                Block *cur = stack[--stack_len];
+                /* push children */
+                for (Block *c = cur->children; c; c = c->next) {
+                    if (stack_len + 1 > stack_cap) {
+                        stack_cap *= 2;
+                        stack = realloc(stack, sizeof(Block*) * stack_cap);
+                    }
+                    stack[stack_len++] = c;
+                }
+                /* resolve fields in cur */
+                for (Field *f = cur->fields; f; f = f->next) {
+                    if (f->value.kind == VAL_REF) {
+                        int changed = try_resolve_value_for_field(root, cur, &f->value, 0);
+                        any_changed |= changed;
+                    } else if (f->value.kind == VAL_ARRAY) {
+                        /* arrays may contain refs: resolve elements */
+                        int changed = 0;
+                        ValueItem *it = f->value.arr;
+                        while (it) {
+                            if (it->v.kind == VAL_REF) {
+                                changed |= try_resolve_value_for_field(root, cur, &it->v, 0);
+                            }
+                            it = it->next;
+                        }
+                        any_changed |= changed;
+                    }
+                }
+            }
+            free(stack);
+            b = b->next;
+        }
+        if (!any_changed) break;
+    }
+}
+
 /* ---------- printing/freeing ---------- */
 
 static void print_block(const Block *b, int indent);
@@ -665,6 +1102,10 @@ int main(int argc, char **argv) {
     fclose(f);
 
     Block *root = parse_all(text);
+
+    /* resolve references in-place */
+    resolve_all_refs(root);
+
     print_all(root);
     free_blocks(root);
     free(text);
