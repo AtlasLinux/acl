@@ -547,6 +547,11 @@ static RefSeg *parse_ref_path_segments(void) {
 /* parse a reference value starting at current token (handles $, $., and ^) */
 static Value parse_reference_value(void) {
     Token t = cur_token();
+
+    size_t start_pos  = t.pos;
+    int    start_line = t.line;
+    int    start_col  = t.col;
+
     if (t.kind == TOK_DOLLAR) {
         consume_token(); /* consume $ */
         Token next = cur_token();
@@ -555,6 +560,9 @@ static Value parse_reference_value(void) {
             /* local: $.field.path */
             consume_token(); /* consume '.' */
             r = ref_create(REF_LOCAL);
+            r->pos = start_pos;
+            r->line = start_line;
+            r->col = start_col;
             Token id = cur_token();
             if (id.kind != TOK_IDENT) parse_error_token(&id, "identifier after '$.'");
             Token idtok = take_token();
@@ -567,6 +575,9 @@ static Value parse_reference_value(void) {
         } else {
             /* global: $Name.path or $Name["label"].field... */
             r = ref_create(REF_GLOBAL);
+            r->pos = start_pos;
+            r->line = start_line;
+            r->col = start_col;
             Token id = cur_token();
             if (id.kind != TOK_IDENT) parse_error_token(&id, "identifier after '$'");
             Token idtok = take_token();
@@ -581,6 +592,9 @@ static Value parse_reference_value(void) {
         int levels = 0;
         while (cur_token().kind == TOK_CARET) { consume_token(); levels++; }
         Ref *r = ref_create(REF_PARENT);
+        r->pos = start_pos;
+        r->line = start_line;
+        r->col = start_col;
         r->parent_levels = levels;
         Token id = cur_token();
         if (id.kind != TOK_IDENT) parse_error_token(&id, "identifier after '^' in parent reference");
@@ -870,9 +884,13 @@ static Field *find_field_in_block(Block *blk, const char *name) {
 }
 
 static void resolution_error_and_exit(const Ref *r) {
-    fprintf(stderr, "Reference resolution error: ");
-    print_ref(r);
-    printf("\n");
+    /* print location + ref itself */
+    fprintf(stderr,
+        "Reference resolution error at %d:%d: ",
+        r->line, r->col);
+    fprintf(stderr, "\n");
+    /* show the exact line from the source with a caret */
+    show_line_context(r->pos, r->line, r->col);
     exit(1);
 }
 
