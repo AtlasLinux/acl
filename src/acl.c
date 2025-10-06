@@ -339,6 +339,10 @@ typedef struct {
     RefScope scope;
     int parent_levels; /* number of ^ prefixes for parent refs (>=1) */
     RefSeg *head;      /* linked list of segments (name or index) */
+
+    size_t pos;
+    int line;
+    int col;
 } Ref;
 
 /* Value kinds (extended with VAL_REF and VAL_ARRAY) */
@@ -865,61 +869,77 @@ static Field *find_field_in_block(Block *blk, const char *name) {
     return NULL;
 }
 
+static void resolution_error_and_exit(const Ref *r) {
+    fprintf(stderr, "Reference resolution error: ");
+    print_ref(r);
+    printf("\n");
+    exit(1);
+}
+
 /* resolve a Ref into a Value copy, given root list and current block context.
    Returns 1 on success and stores copied value in out (caller must value_free), 0 on failure.
    Ambiguities favor first match. depth limits prevent runaway recursion. */
-static int resolve_ref_to_value(const Block *root_list, const Block *current_block, const Ref *r, Value *out, int depth) {
-    if (!r || !out) return 0;
-    if (depth > 64) return 0;
+/* resolve a Ref into out (deep‐copy), or abort on any failure */
+static int resolve_ref_to_value(const Block *root_list,
+                                const Block *current_block,
+                                const Ref       *r,
+                                Value           *out,
+                                int              depth)
+{
+    if (!r || !out) resolution_error_and_exit(r);
+    if (depth > 64)  resolution_error_and_exit(r);
 
     memset(out, 0, sizeof(*out));
 
-    /* helper: copy field value into out if found */
+    /* helper to copy a field value into out */
     int try_field_copy(const Block *blk, const char *field_name) {
-        if (!blk || !field_name) return 0;
-        Field *f = find_field_in_block((Block *)blk, field_name);
+        Field *f = find_field_in_block((Block*)blk, field_name);
         if (!f) return 0;
         *out = value_deep_copy(&f->value);
         return 1;
     }
 
-    /* start position */
+    /* pick starting block */
     const Block *pos = NULL;
     RefSeg *seg = r->head;
 
     if (r->scope == REF_GLOBAL) {
-        /* global: first segment must be a name (not index) */
-        if (!seg || seg->is_index) return 0;
-        /* find top-level block with that name (scan root_list linked list) */
+        /* first segment must be a name */
+        if (!seg || seg->is_index) resolution_error_and_exit(r);
+        /* scan top‐level list for that block name */
         const Block *b = root_list;
         while (b) {
-            if (b->name && seg->name && strcmp(b->name, seg->name) == 0) { pos = b; break; }
+            if (b->name && strcmp(b->name, seg->name) == 0) { pos = b; break; }
             b = b->next;
         }
-        if (!pos) return 0;
-        seg = seg->next; /* consumed first name */
-    } else if (r->scope == REF_LOCAL) {
-        if (!current_block) return 0;
+        if (!pos) resolution_error_and_exit(r);
+        seg = seg->next;
+    }
+    else if (r->scope == REF_LOCAL) {
+        if (!current_block) resolution_error_and_exit(r);
         pos = current_block;
-    } else { /* REF_PARENT */
-        if (!current_block) return 0;
+    }
+    else { /* REF_PARENT */
+        if (!current_block) resolution_error_and_exit(r);
         pos = current_block;
         for (int i = 0; i < r->parent_levels; ++i) {
-            if (!pos->parent) { pos = NULL; break; }
+            if (!pos->parent) resolution_error_and_exit(r);
             pos = pos->parent;
         }
-        if (!pos) return 0;
     }
 
-    /* Walk remaining segments */
+    /* walk each segment */
     while (seg) {
-        if (!pos) return 0;
+        if (!pos) resolution_error_and_exit(r);
 
         if (seg->is_index) {
-            /* index selects first child with matching label */
+            /* select first child whose label matches */
             const Block *found = NULL;
             for (const Block *c = pos->children; c; c = c->next) {
-                if (c->label && seg->index && strcmp(c->label, seg->index) == 0) { found = c; break; }
+                if (c->label && strcmp(c->label, seg->index) == 0) {
+                    found = c;
+                    break;
+                }
             }
             pos = found;
             seg = seg->next;
@@ -929,40 +949,49 @@ static int resolve_ref_to_value(const Block *root_list, const Block *current_blo
         /* seg is a name */
         RefSeg *next = seg->next;
         if (next && next->is_index) {
-            /* name + index: select child by (name, label) */
+            /* name + index pair: find child by (name,label) */
             const char *lbl = next->index;
             const Block *found = NULL;
             for (const Block *c = pos->children; c; c = c->next) {
-                if (c->name && seg->name && strcmp(c->name, seg->name) == 0) {
-                    if (c->label && lbl && strcmp(c->label, lbl) == 0) { found = c; break; }
+                if (c->name && strcmp(c->name, seg->name) == 0
+                 && c->label && strcmp(c->label, lbl) == 0) {
+                    found = c;
+                    break;
                 }
             }
             pos = found;
-            seg = next->next; /* consumed both */
+            seg = next->next;  /* skip both */
             continue;
-        } else {
-            /* name only: pick first child block with that name */
+        }
+        else {
+            /* lone name: pick first child block with that name */
             const Block *child = NULL;
             for (const Block *c = pos->children; c; c = c->next) {
-                if (c->name && seg->name && strcmp(c->name, seg->name) == 0) { child = c; break; }
+                if (c->name && strcmp(c->name, seg->name) == 0) {
+                    child = c;
+                    break;
+                }
             }
             if (child) {
                 pos = child;
                 seg = seg->next;
                 continue;
             }
-            /* no child found; if this is final segment, treat as field name in pos */
+            /* if final segment, try it as a field name */
             if (seg->next == NULL) {
-                if (try_field_copy(pos, seg->name)) return 1;
-                return 0;
+                if (try_field_copy(pos, seg->name)) {
+                    return 1;
+                }
+                resolution_error_and_exit(r);
             }
-            /* intermediate named segment not found -> fail */
-            return 0;
+            /* intermediate name not found → error */
+            resolution_error_and_exit(r);
         }
     }
 
-    /* If we consumed all segments and ended on a block, that's not a field value -> fail */
-    return 0;
+    /* if we consumed all segments and landed on a block, that's not a field → error */
+    resolution_error_and_exit(r);
+    return 0; /* unreachable */
 }
 
 /* attempt to resolve a single Value if it's VAL_REF; uses block context (the block that owns the field).
