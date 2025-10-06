@@ -1,8 +1,3 @@
-/* acl_lib.c
-   Single-file ACL parser library wrapper.
-   Compile: gcc -std=c11 -O2 -Wall -Wextra -shared -fPIC -o libacl.so acl_lib.c
-*/
-
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
@@ -1153,11 +1148,10 @@ void free_blocks(Block *b) {
     }
 }
 
-/* Forward declarations of parser internals (defined in the pasted code below) */
-extern struct Block; /* opaque here; actual definition comes from pasted code */
+/* Forward declarations of parser internals */
+extern struct Block;
 typedef struct Block Block;
 
-/* The following externs must match the functions in your pasted parser source. */
 extern Block *parse_all(const char *text);
 extern void resolve_all_refs(Block *root);
 extern void print_all(const Block *root);
