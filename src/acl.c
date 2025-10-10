@@ -3,8 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <errno.h>
 #include "acl.h"
+#include "expr.h"
 
 /* ---------- small helpers ---------- */
 
@@ -1055,52 +1055,85 @@ static int try_resolve_value_for_field(const Block *root_list, Block *field_bloc
    This is iterative but will attempt to resolve nested references by multiple passes up to a limit. */
 void resolve_all_refs(Block *root) {
     if (!root) return;
-    /* gather list of blocks for easy traversal (top-down) */
-    /* We'll perform multiple passes until no changes or max passes reached */
+
     const int MAX_PASSES = 16;
     for (int pass = 0; pass < MAX_PASSES; ++pass) {
         int any_changed = 0;
-        /* traverse all blocks */
-        Block *b = root;
-        while (b) {
-            /* traverse recursively children via stack */
-            /* We'll implement simple DFS using array stack */
-            size_t stack_cap = 64;
-            Block **stack = malloc(sizeof(Block*) * stack_cap);
-            size_t stack_len = 0;
-            stack[stack_len++] = b;
-            while (stack_len) {
-                Block *cur = stack[--stack_len];
-                /* push children */
+
+        // traverse top‐level blocks
+        for (Block *b = root; b; b = b->next) {
+            // simple DFS stack for children
+            size_t cap = 64;
+            Block **stack = malloc(sizeof(Block*) * cap);
+            size_t len = 0;
+            stack[len++] = b;
+
+            while (len) {
+                Block *cur = stack[--len];
+
+                // push children onto stack
                 for (Block *c = cur->children; c; c = c->next) {
-                    if (stack_len + 1 > stack_cap) {
-                        stack_cap *= 2;
-                        stack = realloc(stack, sizeof(Block*) * stack_cap);
+                    if (len + 1 > cap) {
+                        cap *= 2;
+                        stack = realloc(stack, sizeof(Block*) * cap);
                     }
-                    stack[stack_len++] = c;
+                    stack[len++] = c;
                 }
-                /* resolve fields in cur */
+
+                // now resolve each field in this block
                 for (Field *f = cur->fields; f; f = f->next) {
+
+                    // 1) resolve any VAL_REF in scalars
                     if (f->value.kind == VAL_REF) {
-                        int changed = try_resolve_value_for_field(root, cur, &f->value, 0);
-                        any_changed |= changed;
-                    } else if (f->value.kind == VAL_ARRAY) {
-                        /* arrays may contain refs: resolve elements */
-                        int changed = 0;
+                        if (try_resolve_value_for_field(root, cur, &f->value, 0)) {
+                            any_changed = 1;
+                            // after a ref resolves, it may produce new refs/arrays
+                        }
+                    }
+                    // 2) resolve refs inside array elements
+                    else if (f->value.kind == VAL_ARRAY) {
                         ValueItem *it = f->value.arr;
                         while (it) {
                             if (it->v.kind == VAL_REF) {
-                                changed |= try_resolve_value_for_field(root, cur, &it->v, 0);
+                                if (try_resolve_value_for_field(root, cur, &it->v, 0)) {
+                                    any_changed = 1;
+                                }
                             }
                             it = it->next;
                         }
-                        any_changed |= changed;
+                    }
+
+                    // 3) evaluate any expression fields
+                    //    - we conventionally declare them as type "expr"
+                    //    - their raw value was parsed as a string literal
+                    else if (f->type
+                          && strcmp(f->type, "expr") == 0
+                          && f->value.kind == VAL_STRING) {
+
+                        // hand the stored string to your expr.h evaluator:
+                        //    char *expr = f->value.sval;
+                        //    char *result = expr_eval_to_string(expr);
+                        //    free(expr);
+                        //    f->value.sval = result;
+                        //
+                        //    if it returns NULL on error, you can handle/report as needed.
+
+                        char *in_expr = f->value.sval;
+                        char *out_str = expr_eval_to_string(in_expr);
+                        if (out_str) {
+                            free(in_expr);
+                            f->value.sval = out_str;
+                            any_changed = 1;
+                        }
+                        // else leave the original and maybe log an error
                     }
                 }
             }
+
             free(stack);
-            b = b->next;
         }
+
+        // if we made no progress on this pass, stop early
         if (!any_changed) break;
     }
 }
